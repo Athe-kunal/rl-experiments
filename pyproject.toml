@@ -17,6 +17,8 @@ dependencies = [
     "uvicorn>=0.36.0",
     "wandb>=0.21.3",
     "weave>=0.52.0",
+    "transformers>=4.57.3",
+    "vllm>=0.16.0",
 ]
 
 [dependency-groups]
@@ -25,7 +27,6 @@ dev = [
     "matplotlib>=3.10.8",
     "pytest>=8.0.0",
     "python-dotenv>=1.2.1",
-    "transformers>=4.57.3",
 ]
 
 [tool.pytest.ini_options]
