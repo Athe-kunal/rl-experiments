@@ -37,6 +37,7 @@ from nanorl.rollout import (
 )
 from nanorl.data import build_rl_dataset, distributed_rl_loader, RewardWorkerPool, apply_overlong_shaping
 from nanorl.weave_logging import WeaveTrajectoryLogger
+from nanorl.wandb_logging import WandbTrainingLogger
 
 
 class _BroadcastBatchResult(NamedTuple):
@@ -165,6 +166,7 @@ if __name__ == "__main__":
     parser.add_argument("--device-type", type=str, default="")
     parser.add_argument("--run-name", type=str, default="dummy", help="wandb run name")
     parser.add_argument("--weave-project", type=str, default="", help="W&B Weave project name")
+    parser.add_argument("--wandb-project", type=str, default="", help="W&B project name for scalar metrics")
     parser.add_argument("--save-dir", type=str, default="rl_checkpoints")
     parser.add_argument("--save-every", type=int, default=0, help="Save a checkpoint every N steps (0 disables)")
     parser.add_argument("--seed", type=int, default=0)
@@ -234,9 +236,19 @@ if __name__ == "__main__":
     # Training loop
     print0(f"Starting RL training: {args.num_steps} steps, {args.prompts_per_step} prompts/step, {args.num_samples} samples/prompt")
     weave_logger = WeaveTrajectoryLogger(project_name=args.weave_project, enabled=master_process)
+    wandb_project = args.wandb_project or args.weave_project
+    wandb_logger = WandbTrainingLogger(
+        project_name=wandb_project,
+        run_name=args.run_name,
+        config=vars(args),
+        enabled=master_process,
+    )
     print0(f"{args.weave_project=}")
+    print0(f"{wandb_project=}")
     print0(f"{weave_logger.is_enabled=}")
+    print0(f"{wandb_logger.is_enabled=}")
 
+    train_start_time = time.time()
     for step in range(args.num_steps):
         t0 = time.time()
         phase = {}
@@ -268,6 +280,7 @@ if __name__ == "__main__":
             shaped_rewards = apply_overlong_shaping(rewards, resp_lens, args.max_new_tokens)
             weave_logger.log_trajectories(
                 step=step,
+                run_name=args.run_name,
                 examples=expanded_examples,
                 responses=responses,
                 reward_infos=_infos,
@@ -349,6 +362,7 @@ if __name__ == "__main__":
         # each with grad accumulation across micro-batches.
         phase_t0 = time.time()
         total_loss = 0.0
+        grad_norms: list[float] = []
         for _epoch in range(args.ppo_epochs):
             optimizer.zero_grad()
             for mb in range(n_microbatches):
@@ -372,7 +386,8 @@ if __name__ == "__main__":
                 loss.backward()
                 total_loss += loss.item()
 
-            torch.nn.utils.clip_grad_norm_(raw_model.parameters(), 1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), 1.0)
+            grad_norms.append(float(grad_norm))
             optimizer.step()
         phase["update_s"] = time.time() - phase_t0
 
@@ -390,8 +405,19 @@ if __name__ == "__main__":
         phase["sync_rollout_s"] = time.time() - phase_t0
 
         dt = time.time() - t0
+        avg_loss = total_loss / max(args.ppo_epochs, 1)
+        grad_norm_mean = mean(grad_norms) if grad_norms else 0.0
+        grad_norm_max = max(grad_norms) if grad_norms else 0.0
+        response_len_mean = mean(resp_lens) if master_process and resp_lens else 0.0
+        truncation_ratio = (
+            (n_truncated / len(resp_lens))
+            if master_process and resp_lens
+            else 0.0
+        )
+        train_elapsed_s = time.time() - train_start_time
+
         print0(
-            f"step {step:04d}/{args.num_steps:04d} | loss: {total_loss:.4f} | reward: {mean_reward:.4f} "
+            f"step {step:04d}/{args.num_steps:04d} | loss: {avg_loss:.4f} | reward: {mean_reward:.4f} "
             f"| local_bsz: {local_bsz} | dt: {dt:.1f}s "
             f"| phases(fetch={phase.get('fetch_prompts_s', 0.0):.1f}s "
             f"rollout={phase.get('rollout_s', 0.0):.1f}s "
@@ -402,6 +428,28 @@ if __name__ == "__main__":
             f"update={phase['update_s']:.1f}s "
             f"sync={phase['sync_rollout_s']:.1f}s)"
         )
+
+        wandb_metrics = {
+            "train/loss": avg_loss,
+            "train/avg_reward": mean_reward,
+            "train/grad_norm_mean": grad_norm_mean,
+            "train/grad_norm_max": grad_norm_max,
+            "train/learning_rate": optimizer.param_groups[0]["lr"],
+            "train/step_time_s": dt,
+            "train/elapsed_s": train_elapsed_s,
+            "train/local_batch_size": float(local_bsz),
+            "train/response_len_mean": response_len_mean,
+            "train/truncation_ratio": truncation_ratio,
+            "timing/fetch_prompts_s": phase.get("fetch_prompts_s", 0.0),
+            "timing/rollout_s": phase.get("rollout_s", 0.0),
+            "timing/reward_s": phase.get("reward_s", 0.0),
+            "timing/pack_batch_s": phase.get("pack_batch_s", 0.0),
+            "timing/broadcast_and_shard_s": phase["broadcast_and_shard_s"],
+            "timing/old_logprobs_s": phase["old_logprobs_s"],
+            "timing/update_s": phase["update_s"],
+            "timing/sync_rollout_s": phase["sync_rollout_s"],
+        }
+        wandb_logger.log_metrics(step=step, metrics=wandb_metrics)
 
         # 8. Evaluation
         if args.eval_every > 0 and (step + 1) % args.eval_every == 0:
@@ -424,6 +472,7 @@ if __name__ == "__main__":
         tokenizer.save_pretrained(save_path)
         print0(f"Saved to {save_path}")
 
+    wandb_logger.finish()
     if rewarder is not None:
         rewarder.close()
     compute_cleanup()

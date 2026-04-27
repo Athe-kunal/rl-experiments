@@ -48,6 +48,7 @@ class WeaveTrajectoryLogger:
     def log_trajectories(
         self,
         step: int,
+        run_name: str,
         examples: list[Any],
         responses: list[str],
         reward_infos: list[dict[str, Any]],
@@ -63,6 +64,7 @@ class WeaveTrajectoryLogger:
         if num_samples_per_prompt is not None and num_samples_per_prompt > 0:
             self._log_grouped_trajectories(
                 step=step,
+                run_name=run_name,
                 expanded_examples=examples,
                 responses=responses,
                 reward_infos=reward_infos,
@@ -80,6 +82,7 @@ class WeaveTrajectoryLogger:
         ):
             self._log_single_trajectory(
                 step=step,
+                run_name=run_name,
                 index=idx,
                 example=example,
                 response=response,
@@ -92,6 +95,7 @@ class WeaveTrajectoryLogger:
     def _log_single_trajectory(
         self,
         step: int,
+        run_name: str,
         index: int,
         example: Any,
         response: str,
@@ -106,6 +110,7 @@ class WeaveTrajectoryLogger:
         )
         return {
             "step": step,
+            "run_name": run_name,
             "trajectory_index": index,
             "example_id": getattr(example, "id", ""),
             "messages": [
@@ -123,6 +128,7 @@ class WeaveTrajectoryLogger:
         self,
         *,
         step: int,
+        run_name: str,
         prompt_index: int,
         example: Any,
         completions: list[dict[str, Any]],
@@ -134,6 +140,7 @@ class WeaveTrajectoryLogger:
         )
         return {
             "step": step,
+            "run_name": run_name,
             "prompt_index": prompt_index,
             "example_id": getattr(example, "id", ""),
             "messages": [
@@ -148,6 +155,7 @@ class WeaveTrajectoryLogger:
         self,
         *,
         step: int,
+        run_name: str,
         expanded_examples: list[Any],
         responses: list[str],
         reward_infos: list[dict[str, Any]],
@@ -199,6 +207,7 @@ class WeaveTrajectoryLogger:
                 )
             self._log_grouped_trajectory(
                 step=step,
+                run_name=run_name,
                 prompt_index=prompt_index,
                 example=example,
                 completions=completions,
