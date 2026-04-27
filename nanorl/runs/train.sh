@@ -19,9 +19,10 @@ TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-2}"
 LR="${LR:-1e-6}"
 PROMPTS_PER_STEP="${PROMPTS_PER_STEP:-16}"
 
-RUN_DIR="$BASE_DIR/rl/$TAG"
+RUN_DIR="$BASE_DIR/runs/$TAG"
+CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-$BASE_DIR/checkpoints}"
+SAVE_DIR="$CHECKPOINT_ROOT/$TAG"
 ROLLOUT_SYNC_DIR="$RUN_DIR/rollout_sync"
-SAVE_DIR="$RUN_DIR/checkpoints"
 WORKER_LOG="$RUN_DIR/rollout_worker.log"
 TRAIN_LOG="$RUN_DIR/train.log"
 
@@ -58,6 +59,7 @@ mkdir -p "$RUN_DIR" "$ROLLOUT_SYNC_DIR" "$SAVE_DIR"
 
 echo "[launcher] run tag: $TAG"
 echo "[launcher] run dir: $RUN_DIR"
+echo "[launcher] save dir: $SAVE_DIR"
 echo "[launcher] starting rollout worker on GPUs $ROLLOUT_GPUS (tp=$ROLLOUT_TP) -> $WORKER_LOG"
 CUDA_VISIBLE_DEVICES="$ROLLOUT_GPUS" \
   uv run python "$ROOT_DIR/nanorl/scripts/rollout_worker.py" \
