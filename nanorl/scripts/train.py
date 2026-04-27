@@ -273,6 +273,9 @@ if __name__ == "__main__":
                 reward_infos=_infos,
                 verifier_rewards=rewards,
                 training_rewards=shaped_rewards,
+                num_samples_per_prompt=args.num_samples,
+                rollouts=rollouts,
+                max_new_tokens=args.max_new_tokens,
             )
             rewards = shaped_rewards
             mean_reward = sum(rewards) / len(rewards) if rewards else 0.0

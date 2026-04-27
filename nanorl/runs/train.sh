@@ -101,6 +101,7 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" \
     --eval-every 20 \
     --save-every "$SAVE_EVERY" \
     --lr "$LR" \
+    --weave-project dapo_test \
     --kl-coeff 0.0 \
     --temperature 1.0 \
     --top-k -1 \
