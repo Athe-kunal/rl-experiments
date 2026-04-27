@@ -27,7 +27,7 @@ WORKER_LOG="$RUN_DIR/rollout_worker.log"
 TRAIN_LOG="$RUN_DIR/train.log"
 
 export PYTHONPATH="$ROOT_DIR"
-export BASE_DIR="$BASE_DIR"
+export RL_BASE_DIR="$BASE_DIR"
 export ROLLOUT_HOST
 export ROLLOUT_PORT
 

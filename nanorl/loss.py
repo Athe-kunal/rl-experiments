@@ -194,10 +194,32 @@ def gspo_loss(
         loss = loss + kl_coeff * kl
     return loss
 
+def cispo_loss(
+    logprobs,
+    old_logprobs,
+    advantages,
+    response_mask,
+    clip_high=0.2,   # epsilon_high;
+    **kwargs,
+):
+    """CISPO loss (MiniMax-M1). One-sided IS-weight clip, stop-gradient on weight,
+    gradient flows through log π. Token-mean aggregation across the batch."""
+    lp = logprobs.float()
+    old_lp = old_logprobs.float()
+    adv = advantages.float().unsqueeze(-1)                    # [B, 1]
+    mask = response_mask.float()
+
+    ratio = (lp - old_lp).exp()                               # [B, T]
+    # One-sided clip: only upper bound, no lower bound (per paper).
+    clipped = torch.clamp(ratio, max=1.0 + clip_high).detach()
+
+    per_token_obj = clipped * adv * lp                        # objective
+    return -_masked_token_mean(per_token_obj, mask)           # loss = -objective
 
 ALGORITHMS = {
     "grpo": grpo_loss,
     "dapo": dapo_loss,
     "reinforce": reinforce_loss,
-    "gspo": gspo_loss
+    "gspo": gspo_loss,
+    "cispo": cispo_loss
 }

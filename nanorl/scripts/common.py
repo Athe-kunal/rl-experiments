@@ -70,8 +70,8 @@ logger = logging.getLogger(__name__)
 
 def get_base_dir():
     # co-locate nanochat intermediates with other cached data in ~/.cache (by default)
-    if os.environ.get("BASE_DIR"):
-        nanochat_dir = os.environ.get("BASE_DIR")
+    if os.environ.get("RL_BASE_DIR"):
+        nanochat_dir = os.environ.get("RL_BASE_DIR")
         assert nanochat_dir is not None
     else:
         home_dir = os.path.expanduser("~")
