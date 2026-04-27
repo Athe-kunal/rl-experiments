@@ -6,6 +6,7 @@ import os
 import re
 import logging
 import urllib.request
+import fcntl
 import torch
 import torch.distributed as dist
 from filelock import FileLock
@@ -69,8 +70,9 @@ logger = logging.getLogger(__name__)
 
 def get_base_dir():
     # co-locate nanochat intermediates with other cached data in ~/.cache (by default)
-    if os.environ.get("NANOCHAT_BASE_DIR"):
-        nanochat_dir = os.environ.get("NANOCHAT_BASE_DIR")
+    if os.environ.get("BASE_DIR"):
+        nanochat_dir = os.environ.get("BASE_DIR")
+        assert nanochat_dir is not None
     else:
         home_dir = os.path.expanduser("~")
         cache_dir = os.path.join(home_dir, ".cache")
@@ -161,7 +163,21 @@ def get_dist_info():
     else:
         return False, 0, 0, 1
 
-def compute_init():
+
+def autodetect_device_type() -> str:
+    """
+    Pick a reasonable default `device_type` for `compute_init`.
+
+    Returns one of: "cuda", "mps", "cpu".
+    """
+    if torch.cuda.is_available():
+        return "cuda"
+    # MPS is only available on macOS builds; keep it here for portability.
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+def compute_init(device_type: str):
     """Basic initialization that we keep doing over and over, so make common."""
 
     assert device_type in ["cuda", "mps", "cpu"], "Invalid device type atm"

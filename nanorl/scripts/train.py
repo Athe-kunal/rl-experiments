@@ -25,7 +25,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from .common import compute_init, compute_cleanup, print0
+from .common import autodetect_device_type, compute_init, compute_cleanup, print0
 from nanorl.loss import ALGORITHMS, compute_advantages
 from nanorl.rollout import (
     get_logprobs,
