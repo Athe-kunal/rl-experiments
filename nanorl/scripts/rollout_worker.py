@@ -18,9 +18,9 @@ The trainer keeps semantics strict by:
 
 import argparse
 import json
-import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from loguru import logger
 from transformers import AutoTokenizer
 from vllm import LLM
 
@@ -65,11 +65,12 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def log_message(self, fmt, *args):  # pragma: no cover - keep worker stdout clean
-        sys.stdout.write("%s - - [%s] %s\n" % (
-            self.address_string(),
-            self.log_date_time_string(),
-            fmt % args,
-        ))
+        logger.debug(
+            "HTTP request: "
+            f"client={self.address_string()}, "
+            f"time={self.log_date_time_string()}, "
+            f"message={fmt % args}",
+        )
 
     def do_GET(self):
         if self.path != "/health":
@@ -129,7 +130,9 @@ def main():
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.state = state
-    print(f"rollout worker listening on http://{args.host}:{args.port} model={args.model}", flush=True)
+    logger.info(
+        f"Rollout worker listening with {args.host=}, {args.port=}, {args.model=}",
+    )
     server.serve_forever()
 
 

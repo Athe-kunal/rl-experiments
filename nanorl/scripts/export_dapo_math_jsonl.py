@@ -5,11 +5,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import logging
 import sys
 from typing import Any, Mapping
 
 from datasets import load_dataset
+from loguru import logger
 
 DEFAULT_DATASET = "open-r1/DAPO-Math-17k-Processed"
 CONFIG_CHOICES = ("all", "en", "cn")
@@ -19,9 +19,6 @@ _BOXED_HINT = (
     "\n\nPlease reason step by step, and put your final answer in "
     r"\boxed{}."
 )
-
-log = logging.getLogger(__name__)
-
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -90,9 +87,9 @@ def row_to_jsonl_object(
     prompt = _prompt_for_nanorl(row.get("prompt") or "", append_boxed_hint)
     ground_truth = _ground_truth_string(row)
     if not prompt or not ground_truth:
-        log.warning(
-            "skipping row with empty prompt or ground_truth: %s",
-            {"row_index": row_index, "id_hint": _stable_example_id(row, row_index)},
+        logger.warning(
+            f"Skipping row with empty prompt or ground_truth: {row_index=}, "
+            f"id_hint={_stable_example_id(row, row_index)}",
         )
         return None
     meta: dict[str, Any] = {"hf_config": config_name}
@@ -120,14 +117,7 @@ def load_and_convert(
     split: str,
     append_boxed_hint: bool,
 ) -> list[dict[str, Any]]:
-    log.info(
-        "%s",
-        {
-            "dataset_id": dataset_id,
-            "config_name": config_name,
-            "split": split,
-        },
-    )
+    logger.info(f"{dataset_id=}, {config_name=}, {split=}")
     ds = load_dataset(dataset_id, config_name, split=split)
     out: list[dict[str, Any]] = []
     loaded_rows = 0
@@ -136,12 +126,12 @@ def load_and_convert(
         obj = row_to_jsonl_object(row, i, config_name, append_boxed_hint)
         if obj is not None:
             out.append(obj)
-    log.info("%s", {"loaded_rows": loaded_rows, "written_rows": len(out)})
+    written_rows = len(out)
+    logger.info(f"{loaded_rows=}, {written_rows=}")
     return out
 
 
 def main(argv: list[str] | None = None) -> int:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     args = build_arg_parser().parse_args(argv)
     records = load_and_convert(
         args.dataset,
@@ -150,7 +140,8 @@ def main(argv: list[str] | None = None) -> int:
         append_boxed_hint=not args.no_append_boxed_hint,
     )
     write_jsonl(args.output, records)
-    log.info("%s", {"output": args.output, "num_lines": len(records)})
+    num_lines = len(records)
+    logger.info(f"output={args.output}, {num_lines=}")
     return 0
 
 

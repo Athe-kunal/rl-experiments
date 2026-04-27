@@ -3,13 +3,13 @@ Common utilities for nanochat.
 """
 
 import os
-import re
-import logging
 import urllib.request
 import fcntl
+import sys
 import torch
 import torch.distributed as dist
 from filelock import FileLock
+from loguru import logger
 
 # The dtype used for compute (matmuls, activations). Master weights stay fp32 for optimizer precision.
 # Linear layers cast their weights to this dtype in forward, replacing torch.amp.autocast.
@@ -31,42 +31,22 @@ def _detect_compute_dtype():
     return torch.float32, "auto-detected: no CUDA (CPU/MPS)"
 COMPUTE_DTYPE, COMPUTE_DTYPE_REASON = _detect_compute_dtype()
 
-class ColoredFormatter(logging.Formatter):
-    """Custom formatter that adds colors to log messages."""
-    # ANSI color codes
-    COLORS = {
-        'DEBUG': '\033[36m',    # Cyan
-        'INFO': '\033[32m',     # Green
-        'WARNING': '\033[33m',  # Yellow
-        'ERROR': '\033[31m',    # Red
-        'CRITICAL': '\033[35m', # Magenta
-    }
-    RESET = '\033[0m'
-    BOLD = '\033[1m'
-    def format(self, record):
-        # Add color to the level name
-        levelname = record.levelname
-        if levelname in self.COLORS:
-            record.levelname = f"{self.COLORS[levelname]}{self.BOLD}{levelname}{self.RESET}"
-        # Format the message
-        message = super().format(record)
-        # Add color to specific parts of the message
-        if levelname == 'INFO':
-            # Highlight numbers and percentages
-            message = re.sub(r'(\d+\.?\d*\s*(?:GB|MB|%|docs))', rf'{self.BOLD}\1{self.RESET}', message)
-            message = re.sub(r'(Shard \d+)', rf'{self.COLORS["INFO"]}{self.BOLD}\1{self.RESET}', message)
-        return message
-
-def setup_default_logging():
-    handler = logging.StreamHandler()
-    handler.setFormatter(ColoredFormatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
-    logging.basicConfig(
-        level=logging.INFO,
-        handlers=[handler]
+def setup_default_logging() -> None:
+    logger.remove()
+    logger.add(
+        sys.stderr,
+        level="INFO",
+        colorize=True,
+        format=(
+            "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
+            "<level>{level: <8}</level> | "
+            "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
+            "<level>{message}</level>"
+        ),
     )
 
+
 setup_default_logging()
-logger = logging.getLogger(__name__)
 
 def get_base_dir():
     # co-locate nanochat intermediates with other cached data in ~/.cache (by default)
@@ -103,14 +83,14 @@ def download_file_with_lock(url, filename, postprocess_fn=None):
             return file_path
 
         # Download the content as bytes
-        print(f"Downloading {url}...")
+        logger.info(f"{url=}")
         with urllib.request.urlopen(url) as response:
             content = response.read() # bytes
 
         # Write to local file
         with open(file_path, 'wb') as f:
             f.write(content)
-        print(f"Downloaded to {file_path}")
+        logger.info(f"{file_path=}")
 
         # Run the postprocess function if provided
         if postprocess_fn is not None:
@@ -210,7 +190,7 @@ def compute_init(device_type: str):
         device = torch.device(device_type) # mps|cpu
 
     if ddp_rank == 0:
-        logger.info(f"Distributed world size: {ddp_world_size}")
+        logger.info(f"{ddp_world_size=}")
 
     return is_ddp_requested, ddp_rank, ddp_local_rank, ddp_world_size, device
 
@@ -281,5 +261,5 @@ def get_peak_flops(device_name: str) -> float:
         return 512 * max_comp_units * 1300 * 10**6
 
     # Unknown GPU - return inf so MFU shows as 0% rather than a wrong guess
-    logger.warning(f"Peak flops undefined for: {device_name}, MFU will show as 0%")
+    logger.warning(f"{device_name=}; MFU will show as 0%")
     return float('inf')
