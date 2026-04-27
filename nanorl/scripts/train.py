@@ -30,9 +30,9 @@ from nanorl.loss import ALGORITHMS, compute_advantages
 from nanorl.rollout import (
     get_logprobs,
     generate_rollouts_remote,
-    materialize_rollout_checkpoint,
-    remote_vllm_reload,
+    remote_vllm_init_weight_transfer,
     prepare_batch,
+    sync_weights_to_vllm_inplace,
     wait_for_rollout_worker,
 )
 from nanorl.data import build_rl_dataset, distributed_rl_loader, RewardWorkerPool, apply_overlong_shaping
@@ -150,7 +150,7 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--rollout-worker-url", type=str, default="http://127.0.0.1:8047")
-    parser.add_argument("--rollout-sync-dir", type=str, default="")
+    parser.add_argument("--rollout-worker-world-size", type=int, default=1)
     # Training
     parser.add_argument("--lr", type=float, default=1e-6, help="Learning rate")
     parser.add_argument("--num-steps", type=int, default=200, help="Number of RL steps")
@@ -207,6 +207,17 @@ if __name__ == "__main__":
     if master_process:
         health = wait_for_rollout_worker(args.rollout_worker_url, timeout_s=300)
         print0(f"Remote vLLM rollout worker ready: {health['model_path']}")
+        master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
+        master_port = int(os.environ.get("MASTER_PORT", "29500"))
+        trainer_world_size = ddp_world_size
+        world_size = trainer_world_size + args.rollout_worker_world_size
+        remote_vllm_init_weight_transfer(
+            args.rollout_worker_url,
+            master_address=master_addr,
+            master_port=master_port,
+            rank_offset=trainer_world_size,
+            world_size=world_size,
+        )
 
     # -----------------------------------------------------------------------------
     # RL dataset + reward worker pool + loss fn
@@ -391,17 +402,16 @@ if __name__ == "__main__":
             optimizer.step()
         phase["update_s"] = time.time() - phase_t0
 
-        # 7. Checkpoint + ask remote worker to reload so next-step rollouts are on-policy
+        # 7. In-place sync to remote worker so next-step rollouts are on-policy.
         phase_t0 = time.time()
         if master_process:
-            sync_root = args.rollout_sync_dir or os.path.join(args.save_dir, "rollout_sync")
-            checkpoint_path = materialize_rollout_checkpoint(
-                raw_model,
-                sync_root=sync_root,
-                slot_idx=step % 2,
-                tokenizer_source=args.model,
+            sync_weights_to_vllm_inplace(
+                train_model=raw_model,
+                base_url=args.rollout_worker_url,
+                model_update_group=dist.group.WORLD if ddp else None,
+                packed=True,
+                fsdp=False,
             )
-            remote_vllm_reload(args.rollout_worker_url, checkpoint_path)
         phase["sync_rollout_s"] = time.time() - phase_t0
 
         dt = time.time() - t0
