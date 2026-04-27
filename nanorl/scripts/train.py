@@ -16,6 +16,7 @@ import os
 import math
 import time
 import argparse
+from typing import NamedTuple
 from statistics import mean
 
 import torch
@@ -35,6 +36,102 @@ from nanorl.rollout import (
     wait_for_rollout_worker,
 )
 from nanorl.data import build_rl_dataset, distributed_rl_loader, RewardWorkerPool, apply_overlong_shaping
+from nanorl.weave_logging import WeaveTrajectoryLogger
+
+
+class _BroadcastBatchResult(NamedTuple):
+    batch: dict[str, torch.Tensor]
+    advantages: torch.Tensor
+    mean_reward: float
+
+
+def summarize_rewards(rewards: list[float]) -> str:
+    if not rewards:
+        return "n=0"
+    nonzero = sum(1 for r in rewards if r != 0.0)
+    return (
+        f"n={len(rewards)} "
+        f"mean={mean(rewards):.4f} "
+        f"min={min(rewards):.4f} "
+        f"max={max(rewards):.4f} "
+        f"nonzero={nonzero}/{len(rewards)} ({nonzero / len(rewards):.1%})"
+    )
+
+
+def broadcast_batch(
+    master_process: bool,
+    ddp: bool,
+    device: torch.device,
+    ddp_rank: int,
+    ddp_world_size: int,
+    batch: dict[str, torch.Tensor] | None,
+    advantages: torch.Tensor | None,
+    mean_reward: float,
+) -> _BroadcastBatchResult:
+    """Broadcast a rollout batch prepared by rank 0 to every training rank."""
+    del ddp_rank  # unused, kept in signature for caller clarity.
+    del ddp_world_size  # unused, kept in signature for caller clarity.
+    if master_process:
+        assert batch is not None
+        assert advantages is not None
+        batch = {k: v.to(device) for k, v in batch.items()}
+        advantages = advantages.to(device)
+        meta = torch.tensor(
+            [batch["input_ids"].shape[0], batch["input_ids"].shape[1]],
+            dtype=torch.long,
+            device=device,
+        )
+        reward_meta = torch.tensor([mean_reward], dtype=torch.float32, device=device)
+    else:
+        meta = torch.zeros(2, dtype=torch.long, device=device)
+        reward_meta = torch.zeros(1, dtype=torch.float32, device=device)
+
+    if ddp:
+        dist.broadcast(meta, src=0)
+        dist.broadcast(reward_meta, src=0)
+
+    total_samples, max_len = meta.tolist()
+    if not master_process:
+        batch = {
+            "input_ids": torch.empty((total_samples, max_len), dtype=torch.long, device=device),
+            "attention_mask": torch.empty((total_samples, max_len), dtype=torch.long, device=device),
+            "response_mask": torch.empty((total_samples, max_len), dtype=torch.float32, device=device),
+            "rewards": torch.empty(total_samples, dtype=torch.float32, device=device),
+        }
+        advantages = torch.empty(total_samples, dtype=torch.float32, device=device)
+
+    if ddp:
+        dist.broadcast(batch["input_ids"], src=0)
+        dist.broadcast(batch["attention_mask"], src=0)
+        dist.broadcast(batch["response_mask"], src=0)
+        dist.broadcast(batch["rewards"], src=0)
+        assert advantages is not None
+        dist.broadcast(advantages, src=0)
+
+    assert batch is not None
+    assert advantages is not None
+    return _BroadcastBatchResult(
+        batch=batch,
+        advantages=advantages,
+        mean_reward=float(reward_meta.item()),
+    )
+
+
+def local_shard(
+    batch: dict[str, torch.Tensor],
+    advantages: torch.Tensor,
+    ddp_rank: int,
+    ddp_world_size: int,
+) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+    total_samples = batch["input_ids"].shape[0]
+    per_rank = total_samples // ddp_world_size
+    start = ddp_rank * per_rank
+    end = start + per_rank
+    local_batch = {k: v[start:end] for k, v in batch.items()}
+    local_advantages = advantages[start:end]
+    return local_batch, local_advantages
+
+
 if __name__ == "__main__":
 
     # -----------------------------------------------------------------------------
@@ -67,6 +164,7 @@ if __name__ == "__main__":
     # Runtime
     parser.add_argument("--device-type", type=str, default="")
     parser.add_argument("--run-name", type=str, default="dummy", help="wandb run name")
+    parser.add_argument("--weave-project", type=str, default="", help="W&B Weave project name")
     parser.add_argument("--save-dir", type=str, default="rl_checkpoints")
     parser.add_argument("--save-every", type=int, default=0, help="Save a checkpoint every N steps (0 disables)")
     parser.add_argument("--seed", type=int, default=0)
@@ -132,70 +230,12 @@ if __name__ == "__main__":
     )
 
 
-    def summarize_rewards(rewards):
-        if not rewards:
-            return "n=0"
-        nonzero = sum(1 for r in rewards if r != 0.0)
-        return (
-            f"n={len(rewards)} "
-            f"mean={mean(rewards):.4f} "
-            f"min={min(rewards):.4f} "
-            f"max={max(rewards):.4f} "
-            f"nonzero={nonzero}/{len(rewards)} ({nonzero / len(rewards):.1%})"
-        )
-
-
-    def broadcast_batch(batch, advantages, mean_reward):
-        """Broadcast a rollout batch prepared by rank 0 to every training rank."""
-        if master_process:
-            batch = {k: v.to(device) for k, v in batch.items()}
-            advantages = advantages.to(device)
-            meta = torch.tensor(
-                [batch["input_ids"].shape[0], batch["input_ids"].shape[1]],
-                dtype=torch.long,
-                device=device,
-            )
-            reward_meta = torch.tensor([mean_reward], dtype=torch.float32, device=device)
-        else:
-            meta = torch.zeros(2, dtype=torch.long, device=device)
-            reward_meta = torch.zeros(1, dtype=torch.float32, device=device)
-
-        if ddp:
-            dist.broadcast(meta, src=0)
-            dist.broadcast(reward_meta, src=0)
-
-        total_samples, max_len = meta.tolist()
-        if not master_process:
-            batch = {
-                "input_ids": torch.empty((total_samples, max_len), dtype=torch.long, device=device),
-                "attention_mask": torch.empty((total_samples, max_len), dtype=torch.long, device=device),
-                "response_mask": torch.empty((total_samples, max_len), dtype=torch.float32, device=device),
-                "rewards": torch.empty(total_samples, dtype=torch.float32, device=device),
-            }
-            advantages = torch.empty(total_samples, dtype=torch.float32, device=device)
-
-        if ddp:
-            dist.broadcast(batch["input_ids"], src=0)
-            dist.broadcast(batch["attention_mask"], src=0)
-            dist.broadcast(batch["response_mask"], src=0)
-            dist.broadcast(batch["rewards"], src=0)
-            dist.broadcast(advantages, src=0)
-
-        return batch, advantages, float(reward_meta.item())
-
-
-    def local_shard(batch, advantages):
-        total_samples = batch["input_ids"].shape[0]
-        per_rank = total_samples // ddp_world_size
-        start = ddp_rank * per_rank
-        end = start + per_rank
-        local_batch = {k: v[start:end] for k, v in batch.items()}
-        local_advantages = advantages[start:end]
-        return local_batch, local_advantages
-
     # -----------------------------------------------------------------------------
     # Training loop
     print0(f"Starting RL training: {args.num_steps} steps, {args.prompts_per_step} prompts/step, {args.num_samples} samples/prompt")
+    weave_logger = WeaveTrajectoryLogger(project_name=args.weave_project, enabled=master_process)
+    print0(f"{args.weave_project=}")
+    print0(f"{weave_logger.is_enabled=}")
 
     for step in range(args.num_steps):
         t0 = time.time()
@@ -225,7 +265,16 @@ if __name__ == "__main__":
             expanded_examples = [examples[i // args.num_samples] for i in range(len(rollouts))]
             responses = [r["response"] for r in rollouts]
             rewards, _infos = rewarder.score(expanded_examples, responses, step=step)
-            rewards = apply_overlong_shaping(rewards, resp_lens, args.max_new_tokens)
+            shaped_rewards = apply_overlong_shaping(rewards, resp_lens, args.max_new_tokens)
+            weave_logger.log_trajectories(
+                step=step,
+                examples=expanded_examples,
+                responses=responses,
+                reward_infos=_infos,
+                verifier_rewards=rewards,
+                training_rewards=shaped_rewards,
+            )
+            rewards = shaped_rewards
             mean_reward = sum(rewards) / len(rewards) if rewards else 0.0
             phase["reward_s"] = time.time() - phase_t0
             reward_summary = summarize_rewards(rewards)
@@ -255,8 +304,13 @@ if __name__ == "__main__":
             reward_summary = ""
 
         phase_t0 = time.time()
-        batch, advantages, mean_reward = broadcast_batch(batch, advantages, mean_reward)
-        batch, advantages = local_shard(batch, advantages)
+        broadcast_result = broadcast_batch(
+            master_process, ddp, device, ddp_rank, ddp_world_size, batch, advantages, mean_reward,
+        )
+        batch = broadcast_result.batch
+        advantages = broadcast_result.advantages
+        mean_reward = broadcast_result.mean_reward
+        batch, advantages = local_shard(batch, advantages, ddp_rank, ddp_world_size)
         local_bsz = batch["input_ids"].shape[0]
         phase["broadcast_and_shard_s"] = time.time() - phase_t0
 
