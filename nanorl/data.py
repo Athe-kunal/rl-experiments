@@ -32,6 +32,7 @@ import json
 import random
 import traceback
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 
 # ----------------------------------------------------------------------------
@@ -78,6 +79,56 @@ class JSONLRLDataset:
         return self.examples[i]
 
 
+class _IndexedRLDataset:
+    """Dataset view backed by a fixed list of example indices."""
+
+    def __init__(self, base_dataset: JSONLRLDataset, indices: list[int]):
+        self._base_dataset = base_dataset
+        self._indices = indices
+
+    def __len__(self) -> int:
+        return len(self._indices)
+
+    def __getitem__(self, i: int) -> RLExample:
+        return self._base_dataset[self._indices[i]]
+
+
+class _DatasetSplit(NamedTuple):
+    """Train/validation dataset split."""
+
+    train_dataset: JSONLRLDataset | _IndexedRLDataset
+    validation_dataset: JSONLRLDataset | _IndexedRLDataset
+
+
+def split_rl_dataset(
+    dataset: JSONLRLDataset,
+    validation_size: float,
+    seed: int,
+) -> _DatasetSplit:
+    """Create deterministic train/validation views from an in-memory dataset."""
+    if not 0.0 <= validation_size < 1.0:
+        raise ValueError(f"validation_size must be in [0.0, 1.0), got {validation_size}")
+
+    if validation_size == 0.0:
+        empty_dataset = _IndexedRLDataset(dataset, indices=[])
+        return _DatasetSplit(train_dataset=dataset, validation_dataset=empty_dataset)
+
+    dataset_size = len(dataset)
+    num_validation = int(dataset_size * validation_size)
+    num_validation = max(1, num_validation)
+    num_validation = min(dataset_size - 1, num_validation)
+
+    indices = list(range(dataset_size))
+    rng = random.Random(seed)
+    rng.shuffle(indices)
+    validation_indices = sorted(indices[:num_validation])
+    train_indices = sorted(indices[num_validation:])
+
+    train_dataset = _IndexedRLDataset(dataset, indices=train_indices)
+    validation_dataset = _IndexedRLDataset(dataset, indices=validation_indices)
+    return _DatasetSplit(train_dataset=train_dataset, validation_dataset=validation_dataset)
+
+
 RL_DATASET_PATH = os.environ.get("RL_DATASET_PATH", "/local-ssd/mh3897/data/rl/dapo_math_17k.jsonl")
 
 
@@ -92,7 +143,7 @@ def build_rl_dataset() -> JSONLRLDataset:
 # ----------------------------------------------------------------------------
 
 def distributed_rl_loader(
-    dataset: JSONLRLDataset,
+    dataset: JSONLRLDataset | _IndexedRLDataset,
     prompts_per_step: int,
     world_size: int,
     rank: int,

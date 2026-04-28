@@ -61,6 +61,8 @@ class WandbTrainingLogger:
         )
         wandb.define_metric("train/step")
         wandb.define_metric("train/*", step_metric="train/step")
+        wandb.define_metric("timing/*", step_metric="train/step")
+        wandb.define_metric("validation/*", step_metric="train/step")
 
     @property
     def is_enabled(self) -> bool:

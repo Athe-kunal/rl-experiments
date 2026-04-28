@@ -15,6 +15,7 @@ Everything tweakable lives under nanorl/:
 import os
 import math
 import time
+import asyncio
 import argparse
 from typing import NamedTuple
 from statistics import mean
@@ -30,12 +31,19 @@ from nanorl.loss import ALGORITHMS, compute_advantages
 from nanorl.rollout import (
     get_logprobs,
     generate_rollouts_remote,
+    generate_rollouts_remote_async,
     remote_vllm_init_weight_transfer,
     prepare_batch,
     sync_weights_to_vllm_inplace,
     wait_for_rollout_worker,
 )
-from nanorl.data import build_rl_dataset, distributed_rl_loader, RewardWorkerPool, apply_overlong_shaping
+from nanorl.data import (
+    build_rl_dataset,
+    distributed_rl_loader,
+    RewardWorkerPool,
+    apply_overlong_shaping,
+    split_rl_dataset,
+)
 from nanorl.weave_logging import WeaveTrajectoryLogger
 from nanorl.wandb_logging import WandbTrainingLogger
 
@@ -44,6 +52,78 @@ class _BroadcastBatchResult(NamedTuple):
     batch: dict[str, torch.Tensor]
     advantages: torch.Tensor
     mean_reward: float
+
+
+class _ValidationStats(NamedTuple):
+    mean_reward: float
+    response_len_mean: float
+    truncation_ratio: float
+    duration_s: float
+
+
+def _compute_effective_eval_prompts(
+    *,
+    eval_prompts_per_step: int,
+    prompts_per_step: int,
+    validation_dataset_size: int,
+) -> int:
+    """Pick a safe validation batch size for the distributed loader."""
+    requested = eval_prompts_per_step if eval_prompts_per_step > 0 else prompts_per_step
+    if validation_dataset_size <= 0:
+        return 0
+    return min(requested, validation_dataset_size)
+
+
+def _run_validation_step(
+    *,
+    args: argparse.Namespace,
+    loader,
+    rewarder: RewardWorkerPool,
+    weave_logger: WeaveTrajectoryLogger,
+    step: int,
+) -> _ValidationStats:
+    """Run one validation rollout/reward pass on rank 0."""
+    validation_t0 = time.time()
+    examples, _loader_state = next(loader)
+    prompt_texts = [example.prompt for example in examples]
+    rollouts = asyncio.run(generate_rollouts_remote_async(
+        base_url=args.rollout_worker_url,
+        prompts=prompt_texts,
+        num_samples=args.num_samples,
+        max_new_tokens=args.max_new_tokens,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        prompt_chunk_size=args.eval_async_prompt_chunk_size,
+        max_in_flight_requests=args.eval_async_max_in_flight,
+    ))
+    responses = [rollout["response"] for rollout in rollouts]
+    expanded_examples = [examples[i // args.num_samples] for i in range(len(rollouts))]
+    rewards, infos = rewarder.score(expanded_examples, responses, step=step)
+    response_lengths = [len(rollout["response_ids"]) for rollout in rollouts]
+    shaped_rewards = apply_overlong_shaping(rewards, response_lengths, args.max_new_tokens)
+    weave_logger.log_trajectories(
+        step=step,
+        run_name=f"{args.run_name}_validation",
+        examples=expanded_examples,
+        responses=responses,
+        reward_infos=infos,
+        verifier_rewards=rewards,
+        training_rewards=shaped_rewards,
+        num_samples_per_prompt=args.num_samples,
+        rollouts=rollouts,
+        max_new_tokens=args.max_new_tokens,
+    )
+    mean_reward = sum(shaped_rewards) / len(shaped_rewards) if shaped_rewards else 0.0
+    response_len_mean = mean(response_lengths) if response_lengths else 0.0
+    num_truncated = sum(1 for length in response_lengths if length >= args.max_new_tokens)
+    truncation_ratio = (num_truncated / len(response_lengths)) if response_lengths else 0.0
+    duration_s = time.time() - validation_t0
+    return _ValidationStats(
+        mean_reward=mean_reward,
+        response_len_mean=response_len_mean,
+        truncation_ratio=truncation_ratio,
+        duration_s=duration_s,
+    )
 
 
 def summarize_rewards(rewards: list[float]) -> str:
@@ -160,6 +240,10 @@ if __name__ == "__main__":
     parser.add_argument("--max-seq-len", type=int, default=2048)
     # Evaluation
     parser.add_argument("--eval-every", type=int, default=20)
+    parser.add_argument("--eval-prompts-per-step", type=int, default=0)
+    parser.add_argument("--validation-size", type=float, default=0.1)
+    parser.add_argument("--eval-async-prompt-chunk-size", type=int, default=64)
+    parser.add_argument("--eval-async-max-in-flight", type=int, default=8)
     # Task / Reward
     parser.add_argument("--reward-workers", type=int, default=0, help="Reward worker pool size")
     # Runtime
@@ -236,16 +320,43 @@ if __name__ == "__main__":
     # RL dataset + reward worker pool + loss fn
     if master_process:
         dataset = build_rl_dataset()
-        loader = distributed_rl_loader(
+        dataset_split = split_rl_dataset(
             dataset,
+            validation_size=args.validation_size,
+            seed=args.seed,
+        )
+        train_dataset = dataset_split.train_dataset
+        validation_dataset = dataset_split.validation_dataset
+        loader = distributed_rl_loader(
+            train_dataset,
             prompts_per_step=args.prompts_per_step,
             world_size=1,
             rank=0,
             seed=args.seed,
         )
+        validation_prompts_per_step = _compute_effective_eval_prompts(
+            eval_prompts_per_step=args.eval_prompts_per_step,
+            prompts_per_step=args.prompts_per_step,
+            validation_dataset_size=len(validation_dataset),
+        )
+        validation_loader = None
+        if validation_prompts_per_step > 0:
+            validation_loader = distributed_rl_loader(
+                validation_dataset,
+                prompts_per_step=validation_prompts_per_step,
+                world_size=1,
+                rank=0,
+                seed=args.seed + 17,
+            )
         rewarder = RewardWorkerPool(num_workers=args.reward_workers)
+        print0(f"{len(train_dataset)=}")
+        print0(f"{len(validation_dataset)=}")
+        print0(f"{validation_prompts_per_step=}")
+        print0(f"{args.eval_async_prompt_chunk_size=}")
+        print0(f"{args.eval_async_max_in_flight=}")
     else:
         loader = None
+        validation_loader = None
         rewarder = None
     loss_fn = ALGORITHMS[args.algorithm]
 
@@ -472,12 +583,32 @@ if __name__ == "__main__":
             "timing/update_s": phase["update_s"],
             "timing/sync_rollout_s": phase["sync_rollout_s"],
         }
-        wandb_logger.log_metrics(step=step, metrics=wandb_metrics)
 
         # 8. Evaluation
-        if args.eval_every > 0 and (step + 1) % args.eval_every == 0:
-            print0("Evaluating...")
-            # TODO: pass@k evaluation hook
+        if (
+            master_process
+            and validation_loader is not None
+            and args.eval_every > 0
+            and (step + 1) % args.eval_every == 0
+        ):
+            print0("Evaluating on validation split...")
+            validation_stats = _run_validation_step(
+                args=args,
+                loader=validation_loader,
+                rewarder=rewarder,
+                weave_logger=weave_logger,
+                step=step,
+            )
+            validation_metrics = {
+                "validation/mean_reward": validation_stats.mean_reward,
+                "validation/response_len_mean": validation_stats.response_len_mean,
+                "validation/truncation_ratio": validation_stats.truncation_ratio,
+                "validation/eval_time_s": validation_stats.duration_s,
+            }
+            wandb_metrics.update(validation_metrics)
+            print0(f"{validation_stats=}")
+
+        wandb_logger.log_metrics(step=step, metrics=wandb_metrics)
 
         # 9. Periodic checkpoint
         if args.save_every > 0 and (step + 1) % args.save_every == 0 and master_process:
