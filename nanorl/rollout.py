@@ -182,7 +182,7 @@ def remote_vllm_start_update_weights(base_url, metadata: _WeightMetadata, packed
         "dtype_names": metadata.dtype_names,
         "shapes": metadata.shapes,
         "packed": packed,
-        "is_checkpoint_format": False,
+        "is_checkpoint_format": True,
     }
     logger.info(f"Starting in-place vLLM weight update with {packed=}, {len(metadata.names)=}")
     resp = _remote_json_request(
