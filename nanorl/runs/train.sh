@@ -68,6 +68,7 @@ CUDA_VISIBLE_DEVICES="$ROLLOUT_GPUS" \
     --port "$ROLLOUT_PORT" \
     --gpu-memory-utilization "$ROLLOUT_GPU_MEM_UTIL" \
     --tensor-parallel-size "$ROLLOUT_TP" \
+    --weight-transfer-backend nccl \
     >"$WORKER_LOG" 2>&1 &
 WORKER_PID="$!"
 
