@@ -83,7 +83,7 @@ class RolloutState:
     def _run_update(self, payload):
         try:
             logger.info(f"Applying in-place vLLM update with {len(payload['names'])=}, {payload['packed']=}.")
-            self.engine.update_weights(update_info=payload)
+            self.engine.update_weights({"update_info": payload})
         except Exception as exc:  # pragma: no cover - runtime errors are environment-specific.
             self._update_error = exc
         finally:
@@ -109,7 +109,14 @@ class RolloutState:
             f"{payload['master_address']=}, {payload['master_port']=}, "
             f"{payload['rank_offset']=}, {payload['world_size']=}."
         )
-        self.engine.init_weight_transfer_engine(init_info=payload)
+        # Run in a background thread so the HTTP response returns immediately.
+        # The trainer must call trainer_init() concurrently to complete the
+        # NCCL rendezvous; blocking here would deadlock.
+        threading.Thread(
+            target=self.engine.init_weight_transfer_engine,
+            args=({"init_info": payload},),
+            daemon=True,
+        ).start()
 
     def finish_update_weights(self):
         if self._update_thread is None:

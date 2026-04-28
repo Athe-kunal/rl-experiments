@@ -194,7 +194,7 @@ if __name__ == "__main__":
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2")
+    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16, attn_implementation="flash_attention_2")
     model.to(device)
     model.train()
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
@@ -204,20 +204,33 @@ if __name__ == "__main__":
 
     # -----------------------------------------------------------------------------
     # Remote vLLM rollout worker (rank 0 handshake)
+    model_update_group = None
     if master_process:
         health = wait_for_rollout_worker(args.rollout_worker_url, timeout_s=300)
         print0(f"Remote vLLM rollout worker ready: {health['model_path']}")
         master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
-        master_port = int(os.environ.get("MASTER_PORT", "29500"))
         trainer_world_size = ddp_world_size
         world_size = trainer_world_size + args.rollout_worker_world_size
+        # Pick a free port for the weight-transfer rendezvous, separate from
+        # MASTER_PORT which torchrun already has bound.
+        import socket as _socket
+        with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as _s:
+            _s.bind((master_addr, 0))
+            weight_transfer_port = _s.getsockname()[1]
         remote_vllm_init_weight_transfer(
             args.rollout_worker_url,
             master_address=master_addr,
-            master_port=master_port,
+            master_port=weight_transfer_port,
             rank_offset=trainer_world_size,
             world_size=world_size,
         )
+        from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
+        model_update_group = NCCLWeightTransferEngine.trainer_init({
+            "master_address": master_addr,
+            "master_port": weight_transfer_port,
+            "world_size": world_size,
+        })
+        print0("NCCL weight transfer group initialized.")
 
     # -----------------------------------------------------------------------------
     # RL dataset + reward worker pool + loss fn
@@ -408,7 +421,7 @@ if __name__ == "__main__":
             sync_weights_to_vllm_inplace(
                 train_model=raw_model,
                 base_url=args.rollout_worker_url,
-                model_update_group=dist.group.WORLD if ddp else None,
+                model_update_group=model_update_group,
                 packed=True,
                 fsdp=False,
             )

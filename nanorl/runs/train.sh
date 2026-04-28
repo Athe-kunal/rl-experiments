@@ -22,7 +22,6 @@ PROMPTS_PER_STEP="${PROMPTS_PER_STEP:-16}"
 RUN_DIR="$BASE_DIR/runs/$TAG"
 CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-$BASE_DIR/checkpoints}"
 SAVE_DIR="$CHECKPOINT_ROOT/$TAG"
-ROLLOUT_SYNC_DIR="$RUN_DIR/rollout_sync"
 WORKER_LOG="$RUN_DIR/rollout_worker.log"
 TRAIN_LOG="$RUN_DIR/train.log"
 
@@ -55,7 +54,7 @@ cleanup() {
 
 trap cleanup EXIT INT TERM
 
-mkdir -p "$RUN_DIR" "$ROLLOUT_SYNC_DIR" "$SAVE_DIR"
+mkdir -p "$RUN_DIR" "$SAVE_DIR"
 
 echo "[launcher] run tag: $TAG"
 echo "[launcher] run dir: $RUN_DIR"
@@ -90,7 +89,6 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" \
     --algorithm dapo \
     --run-name "$TAG" \
     --rollout-worker-url "http://$ROLLOUT_HOST:$ROLLOUT_PORT" \
-    --rollout-sync-dir "$ROLLOUT_SYNC_DIR" \
     --save-dir "$SAVE_DIR" \
     --num-steps "$NUM_STEPS" \
     --prompts-per-step "$PROMPTS_PER_STEP" \

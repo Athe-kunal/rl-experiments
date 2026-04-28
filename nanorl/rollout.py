@@ -238,10 +238,7 @@ def sync_weights_to_vllm_inplace(
     fsdp: bool = False,
 ):
     """Sync trainer weights into the running vLLM worker without checkpoints."""
-    from vllm.weight_transfer.backends.nccl import (
-        NCCLTrainerSendWeightsArgs,
-        NCCLWeightTransferEngine,
-    )
+    from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
 
     if hasattr(train_model, "module"):
         train_model = train_model.module
@@ -249,12 +246,12 @@ def sync_weights_to_vllm_inplace(
     metadata = collect_weight_metadata(train_model, fsdp=fsdp)
     remote_vllm_start_update_weights(base_url, metadata, packed=packed)
 
-    trainer_args = NCCLTrainerSendWeightsArgs(group=model_update_group, packed=packed)
     param_iterator = _iter_model_parameters(train_model, fsdp=fsdp)
     logger.info(f"Sending trainer weights via NCCL with {packed=}, {fsdp=}.")
     NCCLWeightTransferEngine.trainer_send_weights(
         iterator=param_iterator,
-        trainer_args=trainer_args,
+        group=model_update_group,
+        packed=packed,
     )
 
     remote_vllm_finish_update_weights(base_url)
