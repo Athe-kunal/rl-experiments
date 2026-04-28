@@ -12,6 +12,7 @@ import shutil
 import time
 import urllib.error
 import urllib.request
+import asyncio
 from typing import NamedTuple
 
 from loguru import logger
@@ -128,6 +129,78 @@ def generate_rollouts_remote(base_url, prompts, num_samples, max_new_tokens,
     }
     resp = _remote_json_request(base_url, "POST", "/generate", payload=payload, timeout=1800)
     return resp["rollouts"]
+
+
+def _chunk_prompts(prompts: list[str], chunk_size: int) -> list[list[str]]:
+    """Split prompts into fixed-size chunks while preserving order."""
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+    chunks: list[list[str]] = []
+    for start in range(0, len(prompts), chunk_size):
+        chunks.append(prompts[start:start + chunk_size])
+    return chunks
+
+
+async def _generate_rollout_chunk(
+    *,
+    semaphore: asyncio.Semaphore,
+    base_url: str,
+    prompts: list[str],
+    num_samples: int,
+    max_new_tokens: int,
+    temperature: float,
+    top_k: int,
+) -> list[dict]:
+    """Generate one prompt chunk with bounded async concurrency."""
+    async with semaphore:
+        return await asyncio.to_thread(
+            generate_rollouts_remote,
+            base_url,
+            prompts,
+            num_samples,
+            max_new_tokens,
+            temperature,
+            top_k,
+        )
+
+
+async def generate_rollouts_remote_async(
+    *,
+    base_url: str,
+    prompts: list[str],
+    num_samples: int,
+    max_new_tokens: int,
+    temperature: float,
+    top_k: int,
+    prompt_chunk_size: int,
+    max_in_flight_requests: int,
+) -> list[dict]:
+    """Generate rollouts asynchronously by chunking prompts and gathering requests."""
+    if not prompts:
+        return []
+    if max_in_flight_requests <= 0:
+        raise ValueError(
+            f"max_in_flight_requests must be positive, got {max_in_flight_requests}",
+        )
+    prompt_chunks = _chunk_prompts(prompts, chunk_size=prompt_chunk_size)
+    semaphore = asyncio.Semaphore(max_in_flight_requests)
+    tasks = [
+        _generate_rollout_chunk(
+            semaphore=semaphore,
+            base_url=base_url,
+            prompts=prompt_chunk,
+            num_samples=num_samples,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+        )
+        for prompt_chunk in prompt_chunks
+    ]
+    chunk_rollouts = await asyncio.gather(*tasks)
+    rollouts: list[dict] = []
+    for chunk in chunk_rollouts:
+        rollouts.extend(chunk)
+    return rollouts
 
 
 def remote_vllm_reload(base_url, model_path):
