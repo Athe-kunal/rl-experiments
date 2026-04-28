@@ -31,23 +31,6 @@ def _detect_compute_dtype():
     return torch.float32, "auto-detected: no CUDA (CPU/MPS)"
 COMPUTE_DTYPE, COMPUTE_DTYPE_REASON = _detect_compute_dtype()
 
-def setup_default_logging() -> None:
-    logger.remove()
-    logger.add(
-        sys.stderr,
-        level="INFO",
-        colorize=True,
-        format=(
-            "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
-            "<level>{level: <8}</level> | "
-            "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
-            "<level>{message}</level>"
-        ),
-    )
-
-
-setup_default_logging()
-
 def get_base_dir():
     # co-locate nanochat intermediates with other cached data in ~/.cache (by default)
     if os.environ.get("RL_BASE_DIR"):
