@@ -44,12 +44,17 @@ for gpu in "${TRAIN_GPU_LIST[@]}"; do
 done
 
 WORKER_PID=""
+WORKER_PGID=""
 
 cleanup() {
-  if [[ -n "$WORKER_PID" ]] && kill -0 "$WORKER_PID" 2>/dev/null; then
-    kill "$WORKER_PID" 2>/dev/null || true
-    wait "$WORKER_PID" 2>/dev/null || true
+  if [[ -n "$WORKER_PGID" ]]; then
+    # Kill the entire process group so vllm worker sub-processes are also reaped.
+    kill -- "-$WORKER_PGID" 2>/dev/null || true
+    # Give processes a moment to exit cleanly before force-killing.
+    sleep 2
+    kill -9 -- "-$WORKER_PGID" 2>/dev/null || true
   fi
+  wait "$WORKER_PID" 2>/dev/null || true
 }
 
 trap cleanup EXIT INT TERM
@@ -60,7 +65,8 @@ echo "[launcher] run tag: $TAG"
 echo "[launcher] run dir: $RUN_DIR"
 echo "[launcher] save dir: $SAVE_DIR"
 echo "[launcher] starting rollout worker on GPUs $ROLLOUT_GPUS (tp=$ROLLOUT_TP) -> $WORKER_LOG"
-CUDA_VISIBLE_DEVICES="$ROLLOUT_GPUS" \
+setsid \
+  env CUDA_VISIBLE_DEVICES="$ROLLOUT_GPUS" \
   uv run python "$ROOT_DIR/nanorl/scripts/rollout_worker.py" \
     --model "$MODEL" \
     --host "$ROLLOUT_HOST" \
@@ -70,6 +76,7 @@ CUDA_VISIBLE_DEVICES="$ROLLOUT_GPUS" \
     --weight-transfer-backend nccl \
     >"$WORKER_LOG" 2>&1 &
 WORKER_PID="$!"
+WORKER_PGID="$(ps -o pgid= -p "$WORKER_PID" | tr -d ' ')"
 
 echo "[launcher] waiting for rollout worker health"
 HEALTH_URL="http://$ROLLOUT_HOST:$ROLLOUT_PORT/health"
