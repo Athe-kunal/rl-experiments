@@ -14,8 +14,8 @@ ROLLOUT_GPUS="${ROLLOUT_GPUS:-2}"
 TRAIN_GPUS="${TRAIN_GPUS:-3}"
 ROLLOUT_GPU_MEM_UTIL="${ROLLOUT_GPU_MEM_UTIL:-0.9}"
 NUM_STEPS="${NUM_STEPS:-200}"
-SAVE_EVERY="${SAVE_EVERY:-20}"
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-2}"
+SAVE_EVERY="${SAVE_EVERY:-100}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-8}"
 LR="${LR:-1e-6}"
 PROMPTS_PER_STEP="${PROMPTS_PER_STEP:-16}"
 
@@ -107,7 +107,7 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" \
     --eval-every 20 \
     --save-every "$SAVE_EVERY" \
     --lr "$LR" \
-    --weave-project dapo_test \
+    --weave-project dapo_run \
     --kl-coeff 0.0 \
     --temperature 1.0 \
     --top-k -1 \
