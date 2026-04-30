@@ -2,15 +2,10 @@
 
 from __future__ import annotations
 
+import weave
+import wandb
+
 from typing import Any
-
-try:
-    import weave as _weave
-except ImportError:  # pragma: no cover - optional dependency.
-    weave: Any | None = None
-else:
-    weave = _weave
-
 
 def _empty_system_prompt() -> str:
     return ""
@@ -45,6 +40,34 @@ class WeaveTrajectoryLogger:
     def is_enabled(self) -> bool:
         return self._enabled
 
+    def _log_reward_timeseries(
+        self,
+        step: int,
+        verifier_rewards: list[float],
+        training_rewards: list[float],
+    ) -> None:
+        """Push per-step reward aggregates to W&B as a time series."""
+        if wandb is None or not verifier_rewards:
+            return
+        n = len(verifier_rewards)
+        v_mean = sum(verifier_rewards) / n
+        v_min = min(verifier_rewards)
+        v_max = max(verifier_rewards)
+        t_mean = sum(training_rewards) / n
+        t_min = min(training_rewards)
+        t_max = max(training_rewards)
+        wandb.log(
+            {
+                "train/step": step,
+                "rewards/verifiable_reward_mean": v_mean,
+                "rewards/verifiable_reward_min": v_min,
+                "rewards/verifiable_reward_max": v_max,
+                "rewards/training_reward_mean": t_mean,
+                "rewards/training_reward_min": t_min,
+                "rewards/training_reward_max": t_max,
+            }
+        )
+
     def log_trajectories(
         self,
         step: int,
@@ -61,6 +84,7 @@ class WeaveTrajectoryLogger:
     ) -> None:
         if not self._enabled:
             return
+        self._log_reward_timeseries(step, verifier_rewards, training_rewards)
         if num_samples_per_prompt is not None and num_samples_per_prompt > 0:
             self._log_grouped_trajectories(
                 step=step,

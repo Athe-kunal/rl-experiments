@@ -4,12 +4,7 @@ from __future__ import annotations
 
 from typing import Any, NamedTuple
 
-try:
-    import wandb as _wandb
-except ImportError:  # pragma: no cover - optional dependency.
-    wandb: Any | None = None
-else:
-    wandb = _wandb
+import wandb
 
 
 class _WandbProjectSpec(NamedTuple):
@@ -63,6 +58,7 @@ class WandbTrainingLogger:
         wandb.define_metric("train/*", step_metric="train/step")
         wandb.define_metric("timing/*", step_metric="train/step")
         wandb.define_metric("validation/*", step_metric="train/step")
+        wandb.define_metric("rewards/*", step_metric="train/step")
 
     @property
     def is_enabled(self) -> bool:
