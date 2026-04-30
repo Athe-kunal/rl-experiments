@@ -1,0 +1,15 @@
+{
+  "checkpoint_path": "Qwen/Qwen2.5-1.5B-Instruct",
+  "num_samples": 4,
+  "max_new_tokens": 768,
+  "temperature": 0.6,
+  "top_p": 0.95,
+  "dataset_name": "MathArena/aime_2025",
+  "dataset_split": "train",
+  "wandb_project": "aime-2025-eval",
+  "wandb_entity": null,
+  "wandb_run_name": "qwen2p5-1p5b-aime-eval",
+  "seed": 42,
+  "dtype": "bfloat16",
+  "trust_remote_code": false
+}
