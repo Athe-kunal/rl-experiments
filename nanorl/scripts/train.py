@@ -17,6 +17,7 @@ import math
 import time
 import asyncio
 import argparse
+import itertools
 from typing import NamedTuple
 from statistics import mean
 
@@ -233,7 +234,7 @@ if __name__ == "__main__":
     parser.add_argument("--rollout-worker-world-size", type=int, default=1)
     # Training
     parser.add_argument("--lr", type=float, default=1e-6, help="Learning rate")
-    parser.add_argument("--num-steps", type=int, default=200, help="Number of RL steps")
+    parser.add_argument("--num-steps", type=int, default=200, help="Number of RL steps (-1 to exhaust the full loader)")
     parser.add_argument("--prompts-per-step", type=int, default=8, help="Prompts per RL step")
     parser.add_argument("--train-batch-size", type=int, default=16, help="Training micro-batch size")
     parser.add_argument("--ppo-epochs", type=int, default=1, help="Optimizer steps per rollout batch")
@@ -384,7 +385,8 @@ if __name__ == "__main__":
     print0(f"{wandb_logger.is_enabled=}")
 
     train_start_time = time.time()
-    for step in range(args.num_steps):
+    step_iter = itertools.count() if args.num_steps == -1 else range(args.num_steps)
+    for step in step_iter:
         t0 = time.time()
         phase = {}
 
@@ -551,7 +553,7 @@ if __name__ == "__main__":
         train_elapsed_s = time.time() - train_start_time
 
         print0(
-            f"step {step:04d}/{args.num_steps:04d} | loss: {avg_loss:.4f} | reward: {mean_reward:.4f} "
+            f"step {step:04d}/{'inf' if args.num_steps == -1 else f'{args.num_steps:04d}'} | loss: {avg_loss:.4f} | reward: {mean_reward:.4f} "
             f"| local_bsz: {local_bsz} | dt: {dt:.1f}s "
             f"| phases(fetch={phase.get('fetch_prompts_s', 0.0):.1f}s "
             f"rollout={phase.get('rollout_s', 0.0):.1f}s "
@@ -616,6 +618,18 @@ if __name__ == "__main__":
             raw_model.save_pretrained(step_path, safe_serialization=True)
             tokenizer.save_pretrained(step_path)
             print0(f"[step {step:04d}] saved checkpoint to {step_path}")
+
+        # 10. Epoch-exhaustion stop: when num_steps == -1, run until the loader
+        # wraps from epoch 0 to epoch 1 (one full pass through the dataset).
+        if args.num_steps == -1:
+            _stop = torch.zeros(1, dtype=torch.long, device=device)
+            if master_process:
+                _stop[0] = 1 if _loader_state["epoch"] > 0 else 0
+            if ddp:
+                dist.broadcast(_stop, src=0)
+            if _stop.item():
+                print0(f"[step {step:04d}] loader exhausted, stopping.")
+                break
 
     # -----------------------------------------------------------------------------
     # Save
