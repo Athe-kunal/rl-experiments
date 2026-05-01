@@ -61,12 +61,6 @@ class _ValidationStats(NamedTuple):
     duration_s: float
 
 
-class _WeightTransferInitConfig(NamedTuple):
-    master_addr: str
-    weight_transfer_port: int
-    world_size: int
-
-
 def _compute_effective_eval_prompts(
     *,
     eval_prompts_per_step: int,
@@ -293,64 +287,34 @@ if __name__ == "__main__":
     raw_model = model.module if ddp else model
 
     # -----------------------------------------------------------------------------
-    # Remote vLLM rollout worker + NCCL weight transfer setup.
+    # Remote vLLM rollout worker (rank 0 handshake)
     model_update_group = None
-    weight_transfer_init_config = _WeightTransferInitConfig(
-        master_addr="",
-        weight_transfer_port=0,
-        world_size=0,
-    )
-    trainer_world_size = ddp_world_size
-    world_size = trainer_world_size + args.rollout_worker_world_size
-
     if master_process:
         health = wait_for_rollout_worker(args.rollout_worker_url, timeout_s=300)
         print0(f"Remote vLLM rollout worker ready: {health['model_path']}")
         master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
+        trainer_world_size = ddp_world_size
+        world_size = trainer_world_size + args.rollout_worker_world_size
         # Pick a free port for the weight-transfer rendezvous, separate from
         # MASTER_PORT which torchrun already has bound.
         import socket as _socket
-        with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as socket_server:
-            socket_server.bind((master_addr, 0))
-            weight_transfer_port = socket_server.getsockname()[1]
-        weight_transfer_init_config = _WeightTransferInitConfig(
-            master_addr=master_addr,
-            weight_transfer_port=weight_transfer_port,
-            world_size=world_size,
-        )
-
-    if ddp:
-        broadcast_values = [weight_transfer_init_config]
-        dist.broadcast_object_list(broadcast_values, src=0)
-        weight_transfer_init_config = broadcast_values[0]
-
-    if master_process:
+        with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as _s:
+            _s.bind((master_addr, 0))
+            weight_transfer_port = _s.getsockname()[1]
         remote_vllm_init_weight_transfer(
             args.rollout_worker_url,
-            master_address=weight_transfer_init_config.master_addr,
-            master_port=weight_transfer_init_config.weight_transfer_port,
+            master_address=master_addr,
+            master_port=weight_transfer_port,
             rank_offset=trainer_world_size,
-            world_size=weight_transfer_init_config.world_size,
+            world_size=world_size,
         )
-
-    from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
-    model_update_group = NCCLWeightTransferEngine.trainer_init({
-        "master_address": weight_transfer_init_config.master_addr,
-        "master_port": weight_transfer_init_config.weight_transfer_port,
-        "world_size": weight_transfer_init_config.world_size,
-    })
-    print0("NCCL weight transfer group initialized.")
-
-    # Ensure step-0 rollouts use model weights instead of dummy/random init.
-    sync_weights_to_vllm_inplace(
-        train_model=raw_model,
-        base_url=args.rollout_worker_url,
-        model_update_group=model_update_group,
-        packed=True,
-        fsdp=False,
-        remote_update_enabled=master_process,
-    )
-    print0("Initial trainer weights synced to rollout worker.")
+        from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
+        model_update_group = NCCLWeightTransferEngine.trainer_init({
+            "master_address": master_addr,
+            "master_port": weight_transfer_port,
+            "world_size": world_size,
+        })
+        print0("NCCL weight transfer group initialized.")
 
     # -----------------------------------------------------------------------------
     # RL dataset + reward worker pool + loss fn
@@ -564,14 +528,14 @@ if __name__ == "__main__":
 
         # 7. In-place sync to remote worker so next-step rollouts are on-policy.
         phase_t0 = time.time()
-        sync_weights_to_vllm_inplace(
-            train_model=raw_model,
-            base_url=args.rollout_worker_url,
-            model_update_group=model_update_group,
-            packed=True,
-            fsdp=False,
-            remote_update_enabled=master_process,
-        )
+        if master_process:
+            sync_weights_to_vllm_inplace(
+                train_model=raw_model,
+                base_url=args.rollout_worker_url,
+                model_update_group=model_update_group,
+                packed=True,
+                fsdp=False,
+            )
         phase["sync_rollout_s"] = time.time() - phase_t0
 
         dt = time.time() - t0
