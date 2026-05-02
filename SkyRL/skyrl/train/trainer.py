@@ -252,6 +252,13 @@ class RayPPOTrainer:
                     with Timer("postprocess_generator_output", self.all_timings):
                         generator_output, uids = self.postprocess_generator_output(generator_output, uids)
 
+                    self.log_generation_trajectories(
+                        step=self.global_step,
+                        generator_input=generator_input,
+                        generator_output=generator_output,
+                        uids=uids,
+                    )
+
                     # 2. print example just for debugging
                     log_interval = self.cfg.trainer.log_example_interval
                     if log_interval > 0 and self.global_step % log_interval == 0:
@@ -362,6 +369,10 @@ class RayPPOTrainer:
                 logger.info("Saved final model.")
         self.tracker.finish()
         logger.info("Training done!")
+
+    def log_generation_trajectories(self, *, step: int, generator_input: GeneratorInput, generator_output: GeneratorOutput, uids: List[str]) -> None:
+        """Optional hook for subclasses to log prompt/completion/reward trajectories."""
+        del step, generator_input, generator_output, uids
 
     def _remove_tail_data(self, entries: List[Any]) -> List[Any]:
         """Remove tail data to have even shards in terms of *effective* samples.

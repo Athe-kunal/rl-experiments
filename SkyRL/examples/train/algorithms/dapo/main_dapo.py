@@ -7,14 +7,14 @@ import sys
 import ray
 import torch
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import Any, List, Tuple
 
 from skyrl.train.config import AlgorithmConfig, make_config
 from skyrl.train.trainer import RayPPOTrainer
 from skyrl.train.utils import initialize_ray, validate_cfg
 from skyrl.train.entrypoints.main_base import BasePPOExp
 
-from skyrl.train.generators.base import GeneratorOutput
+from skyrl.train.generators.base import GeneratorInput, GeneratorOutput
 
 
 @dataclass
@@ -39,44 +39,115 @@ class DAPOTrainer(RayPPOTrainer):
     def postprocess_generator_output(
         self, generator_output: GeneratorOutput, uids: List[str]
     ) -> Tuple[GeneratorOutput, List[str]]:
-        # NOTE (sumanthrh): Given the usage of `make_config`, the algorithm config subclass for DAPO is
-        # created dynamically and thus IDEs will not be able to resolve the attributes
-        # For better typing, you can always define a custom subclass of DAPOConfig manually.
-        # See examples/train_integrations/harbor for an example.
         overlong_buffer_len = self.cfg.trainer.algorithm.overlong_buffer_len
         overlong_buffer_penalty_factor = self.cfg.trainer.algorithm.overlong_buffer_penalty_factor
-        # modify rewards here
         response_ids = generator_output["response_ids"]
         rewards = generator_output["rewards"]
 
         assert not isinstance(rewards[0], list), "we assume verifiable sequence level rewards here"
 
-        # get the response length
         response_lengths = [len(response) for response in response_ids]
-
-        # get the max context length
-        # NOTE: this is only valid for single turn generation
         max_response_length = self.cfg.generator.sampling_params.max_generate_length
 
-        # apply soft overlong punishment
         for i, response_length in enumerate(response_lengths):
-            # max_exceed_length is the beginning of the overlong buffer
             max_exceed_length = max_response_length - overlong_buffer_len
-            # if the response is within the overlong buffer, apply the penalty
             if response_length > max_exceed_length and response_length <= max_response_length:
                 exceed_length = response_length - max_exceed_length
                 penalty = exceed_length / overlong_buffer_len * overlong_buffer_penalty_factor
 
                 rewards[i] -= penalty
-            # if the response is outside the overlong buffer, set the reward to 0
             elif response_length > max_response_length:
-                # if self.cfg.generator.apply_overlong_filtering is true, loss masks are already set to 0 for these responses
                 rewards[i] = 0.0
 
         generator_output["rewards"] = rewards
 
-        # use base class impl for metrics and per-token reward conversion
         return super().postprocess_generator_output(generator_output, uids)
+
+    def _extract_prompt_messages(self, prompt: Any) -> list[dict[str, str]]:
+        """Keep prompt as role/content messages (system+user) for trajectory logging."""
+        if isinstance(prompt, str):
+            return [{"role": "user", "content": prompt}]
+        if isinstance(prompt, list):
+            messages: list[dict[str, str]] = []
+            for msg in prompt:
+                if not isinstance(msg, dict):
+                    continue
+                role = msg.get("role")
+                content = msg.get("content")
+                if isinstance(role, str) and isinstance(content, str):
+                    messages.append({"role": role, "content": content})
+            if messages:
+                return messages
+        return [{"role": "user", "content": str(prompt)}]
+
+    def log_generation_trajectories(
+        self,
+        *,
+        step: int,
+        generator_input: GeneratorInput,
+        generator_output: GeneratorOutput,
+        uids: List[str],
+    ) -> None:
+        if "wandb" not in self.tracker.logger:
+            return
+        try:
+            import weave
+            import wandb
+        except Exception:
+            return
+
+        project = self.cfg.trainer.project_name
+        if project:
+            try:
+                weave.init(project)
+            except Exception:
+                pass
+
+        prompts = generator_input.get("prompts", [])
+        response_ids = generator_output.get("response_ids", [])
+        rewards = generator_output.get("rewards", [])
+        if not prompts or not response_ids or not rewards:
+            return
+
+        trajectory_ids = generator_output.get("trajectory_ids")
+        groups: dict[str, list[int]] = {}
+        for i in range(len(response_ids)):
+            if trajectory_ids is not None and i < len(trajectory_ids) and trajectory_ids[i] is not None:
+                key = trajectory_ids[i].instance_id
+            elif i < len(uids):
+                key = uids[i]
+            else:
+                key = f"idx_{i}"
+            groups.setdefault(key, []).append(i)
+
+        for prompt_index, (group_id, idxs) in enumerate(groups.items()):
+            prompt_idx = idxs[0] % len(prompts)
+            prompt_messages = self._extract_prompt_messages(prompts[prompt_idx])
+            completions = []
+            table = wandb.Table(columns=["step", "group_id", "completion_index", "messages", "completion", "reward"])
+            for completion_index, j in enumerate(idxs):
+                completion_text = self.tokenizer.decode(response_ids[j], skip_special_tokens=True)
+                reward_value = float(rewards[j]) if not isinstance(rewards[j], list) else float(sum(rewards[j]))
+                completions.append(
+                    {
+                        "completion_index": completion_index,
+                        "assistant_response": completion_text,
+                        "verifiable_reward": reward_value,
+                        "reward_for_training": reward_value,
+                    }
+                )
+                table.add_data(step, group_id, completion_index, prompt_messages, completion_text, reward_value)
+
+            wandb.log({f"trajectories/group_{group_id}": table}, step=step)
+            weave.publish(
+                {
+                    "step": step,
+                    "group_id": group_id,
+                    "prompt_index": prompt_index,
+                    "messages": prompt_messages,
+                    "completions": completions,
+                }
+            )
 
 
 class DAPOExp(BasePPOExp):
