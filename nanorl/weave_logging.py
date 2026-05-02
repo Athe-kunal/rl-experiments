@@ -175,6 +175,58 @@ class WeaveTrajectoryLogger:
             "completions": completions,
         }
 
+
+
+    def _log_grouped_trajectories_to_wandb(
+        self,
+        *,
+        step: int,
+        run_name: str,
+        prompt_index: int,
+        example: Any,
+        completions: list[dict[str, Any]],
+    ) -> None:
+        """Log grouped prompt/completion/reward trajectories to W&B as a table."""
+        if wandb is None:
+            return
+        system_prompt = _extract_system_prompt(getattr(example, "meta", {}))
+        user_prompt = _resolve_user_prompt(
+            getattr(example, "prompt", None),
+            getattr(example, "rollout_prompt", None),
+        )
+        table = wandb.Table(
+            columns=[
+                "step",
+                "run_name",
+                "prompt_index",
+                "completion_index",
+                "example_id",
+                "system_prompt",
+                "user_prompt",
+                "assistant_response",
+                "verifiable_reward",
+                "reward_for_training",
+                "truncated",
+            ]
+        )
+        example_id = getattr(example, "id", "")
+        for completion in completions:
+            rollout_meta = completion.get("rollout", {})
+            table.add_data(
+                step,
+                run_name,
+                prompt_index,
+                completion.get("completion_index"),
+                example_id,
+                system_prompt,
+                user_prompt,
+                completion.get("assistant_response", ""),
+                completion.get("verifiable_reward"),
+                completion.get("reward_for_training"),
+                rollout_meta.get("truncated"),
+            )
+
+        wandb.log({f"trajectories/group_{prompt_index}": table, "train/step": step})
     def _log_grouped_trajectories(
         self,
         *,
@@ -230,6 +282,13 @@ class WeaveTrajectoryLogger:
                     }
                 )
             self._log_grouped_trajectory(
+                step=step,
+                run_name=run_name,
+                prompt_index=prompt_index,
+                example=example,
+                completions=completions,
+            )
+            self._log_grouped_trajectories_to_wandb(
                 step=step,
                 run_name=run_name,
                 prompt_index=prompt_index,
