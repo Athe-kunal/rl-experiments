@@ -80,6 +80,22 @@ class DAPOTrainer(RayPPOTrainer):
                 return messages
         return [{"role": "user", "content": str(prompt)}]
 
+    def _init_weave(self) -> None:
+        """Initialize weave once; subsequent calls are no-ops."""
+        if getattr(self, "_weave_initialized", False):
+            return
+        try:
+            import weave
+
+            project = self.cfg.trainer.project_name
+            if project:
+                weave.init(project)
+            self._weave_initialized = True
+            self._weave = weave
+        except Exception:
+            self._weave_initialized = False
+            self._weave = None
+
     def log_generation_trajectories(
         self,
         *,
@@ -88,20 +104,15 @@ class DAPOTrainer(RayPPOTrainer):
         generator_output: GeneratorOutput,
         uids: List[str],
     ) -> None:
+        import json
+
         if "wandb" not in self.tracker.logger:
             return
-        try:
-            import weave
-            import wandb
-        except Exception:
-            return
 
-        project = self.cfg.trainer.project_name
-        if project:
-            try:
-                weave.init(project)
-            except Exception:
-                pass
+        wandb = self.tracker.logger["wandb"]
+
+        self._init_weave()
+        weave = self._weave
 
         prompts = generator_input.get("prompts", [])
         response_ids = generator_output.get("response_ids", [])
@@ -123,6 +134,7 @@ class DAPOTrainer(RayPPOTrainer):
         for prompt_index, (group_id, idxs) in enumerate(groups.items()):
             prompt_idx = idxs[0] % len(prompts)
             prompt_messages = self._extract_prompt_messages(prompts[prompt_idx])
+            prompt_messages_str = json.dumps(prompt_messages)
             completions = []
             table = wandb.Table(columns=["step", "group_id", "completion_index", "messages", "completion", "reward"])
             for completion_index, j in enumerate(idxs):
@@ -136,18 +148,19 @@ class DAPOTrainer(RayPPOTrainer):
                         "reward_for_training": reward_value,
                     }
                 )
-                table.add_data(step, group_id, completion_index, prompt_messages, completion_text, reward_value)
+                table.add_data(step, group_id, completion_index, prompt_messages_str, completion_text, reward_value)
 
             wandb.log({f"trajectories/group_{group_id}": table}, step=step)
-            weave.publish(
-                {
-                    "step": step,
-                    "group_id": group_id,
-                    "prompt_index": prompt_index,
-                    "messages": prompt_messages,
-                    "completions": completions,
-                }
-            )
+            if weave is not None:
+                weave.publish(
+                    {
+                        "step": step,
+                        "group_id": group_id,
+                        "prompt_index": prompt_index,
+                        "messages": prompt_messages,
+                        "completions": completions,
+                    }
+                )
 
 
 class DAPOExp(BasePPOExp):

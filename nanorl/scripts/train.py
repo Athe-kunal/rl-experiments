@@ -403,6 +403,13 @@ if __name__ == "__main__":
         raw_model.parameters(), lr=args.lr, betas=(0.9, 0.999), weight_decay=0.01,
     )
 
+    # Linear warmup over 20 rollout steps (DAPO paper §4.1).
+    _warmup_steps = 20
+    def _lr_lambda(current_step: int) -> float:
+        if current_step < _warmup_steps:
+            return float(current_step + 1) / float(_warmup_steps)
+        return 1.0
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_lr_lambda)
 
     # -----------------------------------------------------------------------------
     # Training loop

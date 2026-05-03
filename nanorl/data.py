@@ -217,7 +217,7 @@ def verify_math(example: RLExample, response: str, step: int) -> tuple[float, di
     """Score a math response by extracting the last \\boxed{...} and comparing to ground truth."""
     pred = extract_last_boxed(response)
     matched = pred is not None and _canon(pred) == _canon(example.ground_truth)
-    return (1.0 if matched else 0.0), {
+    return (1.0 if matched else -1.0), {
         "pred": (pred or "")[:200],
         "gt": example.ground_truth[:200],
         "matched": matched,

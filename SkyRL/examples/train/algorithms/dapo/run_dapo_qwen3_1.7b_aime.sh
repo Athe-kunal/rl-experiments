@@ -4,14 +4,17 @@ set -x
 # bash examples/train/algorithms/dapo/prepare_dapo_data.sh
 # bash examples/train/algorithms/dapo/run_dapo_qwen3_1.7b_aime.sh
 
+# Colocate training and inference on GPU 2 and GPU 3.
+export CUDA_VISIBLE_DEVICES=2,3
+
 MODEL_NAME="Qwen/Qwen3-1.7B-Base"
-DATA_DIR="$HOME/data/dapo"
-TRAIN_FILE="$DATA_DIR/dapo-math-17k-cleaned.parquet"
-TEST_FILE="$DATA_DIR/aime-2024-cleaned.parquet"
+DATA_DIR="/home/recoverx/astarag/rl-experiments/data/dapo"
+TRAIN_FILE="$DATA_DIR/dapo-math-17k-openr1-processed.parquet"
+TEST_FILE="$DATA_DIR/aime-2024.parquet"
 NUM_NODES=1
-NUM_GPUS_PER_NODE=8
-NUM_INFERENCE_ENGINES=8
-INFERENCE_ENGINE_TENSOR_PARALLEL_SIZE=1
+NUM_GPUS_PER_NODE=2
+NUM_INFERENCE_ENGINES=1
+INFERENCE_ENGINE_TENSOR_PARALLEL_SIZE=2
 LOGGER="wandb"  # change to "console" to print to stdout
 
 CLIP_RATIO_LOW=0.2
@@ -34,10 +37,10 @@ MAX_PROMPT_LENGTH=$((1024 * 2))
 MAX_RESPONSE_LENGTH=$((1024 * 8))
 
 # repro run parameters
-TRAIN_BATCH_SIZE=512
-MINI_BATCH_SIZE=32
+TRAIN_BATCH_SIZE=16
+MINI_BATCH_SIZE=4
 N_SAMPLES_PER_PROMPT=16
-EVAL_N_SAMPLES_PER_PROMPT=32
+EVAL_N_SAMPLES_PER_PROMPT=16
 ENFORCE_EAGER=true # cuda graphs can cause some instability
 LR=1e-6
 
@@ -92,7 +95,7 @@ uv run --isolated --extra fsdp -m examples.train.algorithms.dapo.main_dapo \
   environment.env_class=aime \
   generator.n_samples_per_prompt=$N_SAMPLES_PER_PROMPT \
   generator.eval_n_samples_per_prompt=$EVAL_N_SAMPLES_PER_PROMPT \
-  generator.inference_engine.gpu_memory_utilization=0.8 \
+  generator.inference_engine.gpu_memory_utilization=0.4 \
   trainer.logger="$LOGGER" \
   trainer.project_name="dapo_aime" \
   trainer.run_name="dapo_qwen3_1.7b_base" \
