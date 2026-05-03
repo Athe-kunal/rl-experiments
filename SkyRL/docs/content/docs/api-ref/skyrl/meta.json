@@ -1,4 +1,0 @@
-{
-  "title": "SkyRL",
-  "pages": ["backends", "tinker-engine", "types", "tx-models", "entrypoints", "config", "sft", "env-vars", "skyrl-train"]
-}

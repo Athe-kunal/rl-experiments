@@ -8,6 +8,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -16,7 +17,7 @@ from datasets import load_dataset
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-dir", type=Path, required=True)
+    parser.add_argument("--data-dir", type=Path, default="data/dapo/")
     parser.add_argument("--train-output", type=str, default="dapo-math-17k-openr1-processed.parquet")
     parser.add_argument("--val-output", type=str, default="aime-2024.parquet")
     args = parser.parse_args()
@@ -32,9 +33,15 @@ def main() -> None:
     split = "train" if "train" in ds else list(ds.keys())[0]
     df = ds[split].to_pandas()
 
-    # Keep full processed payload, only drop exact duplicate rows for stability.
+    # Dedupe on identity columns only: open-r1 rows include ndarray (e.g. source_prompt)
+    # and dict columns that break full-frame drop_duplicates (unhashable).
     before = len(df)
-    df = df.drop_duplicates()
+    df["_dedupe_rm"] = df["reward_model"].apply(
+        lambda x: json.dumps(x, sort_keys=True, default=str) if isinstance(x, dict) else repr(x)
+    )
+    df = df.drop_duplicates(subset=["data_source", "prompt", "ability", "_dedupe_rm"]).drop(
+        columns=["_dedupe_rm"]
+    )
     after = len(df)
     df.to_parquet(train_path, index=False)
 
