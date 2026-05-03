@@ -432,146 +432,223 @@ if __name__ == "__main__":
     for step in step_iter:
         t0 = time.time()
         phase = {}
+        _ds_rounds = 0
+        num_valid_groups = 0
+        _loader_state = None
+        skip_update_master = False
 
         if master_process:
-            # 1. Sample prompts for the whole global batch on rank 0
+            # === Dynamic Sampling (DAPO §3.2) ===
+            # Re-sample batches until `prompts_per_step` groups with mixed accuracy
+            # are collected. Groups where all samples are correct (accuracy=1) or all
+            # wrong (accuracy=0) produce zero advantage and are discarded.
             phase_t0 = time.time()
-            examples, _loader_state = next(loader)
-            prompt_texts = [ex.prompt for ex in examples]
-            phase["fetch_prompts_s"] = time.time() - phase_t0
+            ds_examples: list = []
+            ds_rollouts: list[dict] = []
+            ds_rewards_raw: list[float] = []
+            ds_infos: list[dict] = []
 
-            # 2. Generate rollouts via the remote vLLM worker
-            phase_t0 = time.time()
-            rollouts = generate_rollouts_remote(
-                args.rollout_worker_url, prompt_texts,
-                args.num_samples, args.max_new_tokens,
-                args.temperature, args.top_k,
-            )
-            phase["rollout_s"] = time.time() - phase_t0
-            resp_lens = [len(r["response_ids"]) for r in rollouts]
-            n_truncated = sum(1 for n in resp_lens if n >= args.max_new_tokens)
-            print0(f"[step {step:04d}] truncated={n_truncated}/{len(resp_lens)}")
+            while len(ds_examples) < args.prompts_per_step:
+                _ds_rounds += 1
+                if _ds_rounds > 20:
+                    print0(
+                        f"[step {step:04d}] dynamic sampling: gave up after 20 rounds "
+                        f"({len(ds_examples)}/{args.prompts_per_step} valid groups collected)"
+                    )
+                    break
 
-            # 3. Compute rewards on rank 0
-            phase_t0 = time.time()
-            expanded_examples = [examples[i // args.num_samples] for i in range(len(rollouts))]
-            responses = [r["response"] for r in rollouts]
-            rewards, _infos = rewarder.score(expanded_examples, responses, step=step)
-            shaped_rewards = apply_overlong_shaping(rewards, resp_lens, args.max_new_tokens)
-            weave_logger.log_trajectories(
-                step=step,
-                run_name=args.run_name,
-                examples=expanded_examples,
-                responses=responses,
-                reward_infos=_infos,
-                verifier_rewards=rewards,
-                training_rewards=shaped_rewards,
-                num_samples_per_prompt=args.num_samples,
-                rollouts=rollouts,
-                max_new_tokens=args.max_new_tokens,
-            )
-            rewards = shaped_rewards
-            mean_reward = sum(rewards) / len(rewards) if rewards else 0.0
-            phase["reward_s"] = time.time() - phase_t0
-            reward_summary = summarize_rewards(rewards)
+                round_examples, _loader_state = next(loader)
+                round_prompts = [ex.prompt for ex in round_examples]
+                round_rollouts = generate_rollouts_remote(
+                    args.rollout_worker_url, round_prompts,
+                    args.num_samples, args.max_new_tokens,
+                    args.temperature, args.top_k,
+                )
+                round_expanded = [
+                    round_examples[i // args.num_samples]
+                    for i in range(len(round_rollouts))
+                ]
+                round_responses = [r["response"] for r in round_rollouts]
+                round_rewards_raw, round_infos = rewarder.score(
+                    round_expanded, round_responses, step=step
+                )
 
-            # 4. Pack training batch on CPU, then broadcast to all ranks
-            phase_t0 = time.time()
-            batch = prepare_batch(rollouts, rewards, tokenizer, args.max_seq_len, "cpu")
-            # Group-relative advantages: normalize within each prompt's
-            # num_samples rollouts, not across the whole batch.
-            advantages = compute_advantages(
-                args.algorithm,
-                batch["rewards"],
-                num_samples_per_prompt=args.num_samples,
-            )
-            phase["pack_batch_s"] = time.time() - phase_t0
+                for gi in range(len(round_examples)):
+                    if len(ds_examples) >= args.prompts_per_step:
+                        break
+                    g_start = gi * args.num_samples
+                    g_end = g_start + args.num_samples
+                    g_rewards = round_rewards_raw[g_start:g_end]
+                    # Reward is +1 (correct) or -1 (wrong); keep groups with mixed outcomes.
+                    num_correct = sum(1 for r in g_rewards if r > 0)
+                    if 0 < num_correct < args.num_samples:
+                        ds_examples.append(round_examples[gi])
+                        ds_rollouts.extend(round_rollouts[g_start:g_end])
+                        ds_rewards_raw.extend(g_rewards)
+                        ds_infos.extend(round_infos[g_start:g_end])
 
-            print0(
-                f"[step {step:04d}] prompts={len(examples)} rollouts={len(rollouts)} "
-                f"fetch={phase['fetch_prompts_s']:.1f}s rollout={phase['rollout_s']:.1f}s "
-                f"reward={phase['reward_s']:.1f}s pack={phase['pack_batch_s']:.1f}s "
-                f"rewards[{reward_summary}]"
-            )
+            phase["dynamic_sampling_s"] = time.time() - phase_t0
+            num_valid_groups = len(ds_examples)
+            skip_update_master = num_valid_groups == 0
+
+            if not skip_update_master:
+                examples = ds_examples
+                rollouts = ds_rollouts
+                resp_lens = [len(r["response_ids"]) for r in rollouts]
+                n_truncated = sum(1 for n in resp_lens if n >= args.max_new_tokens)
+
+                phase_t0 = time.time()
+                expanded_examples = [
+                    examples[i // args.num_samples] for i in range(len(rollouts))
+                ]
+                responses = [r["response"] for r in rollouts]
+                shaped_rewards = apply_overlong_shaping(ds_rewards_raw, resp_lens, args.max_new_tokens)
+                weave_logger.log_trajectories(
+                    step=step,
+                    run_name=args.run_name,
+                    examples=expanded_examples,
+                    responses=responses,
+                    reward_infos=ds_infos,
+                    verifier_rewards=ds_rewards_raw,
+                    training_rewards=shaped_rewards,
+                    num_samples_per_prompt=args.num_samples,
+                    rollouts=rollouts,
+                    max_new_tokens=args.max_new_tokens,
+                )
+                rewards = shaped_rewards
+                mean_reward = sum(rewards) / len(rewards) if rewards else 0.0
+                phase["reward_shaping_s"] = time.time() - phase_t0
+                reward_summary = summarize_rewards(rewards)
+
+                phase_t0 = time.time()
+                batch = prepare_batch(rollouts, rewards, tokenizer, args.max_seq_len, "cpu")
+
+                # Overlong Filtering (DAPO §3.4): zero the response_mask for sequences
+                # that hit the generation cap so truncated reasoning doesn't contribute
+                # to the policy gradient. Soft reward punishment was already applied above.
+                for bi, rlen in enumerate(resp_lens):
+                    if rlen >= args.max_new_tokens:
+                        batch["response_mask"][bi] = 0.0
+
+                advantages = compute_advantages(
+                    args.algorithm,
+                    batch["rewards"],
+                    num_samples_per_prompt=args.num_samples,
+                )
+                phase["pack_batch_s"] = time.time() - phase_t0
+
+                print0(
+                    f"[step {step:04d}] ds_rounds={_ds_rounds} "
+                    f"valid_groups={num_valid_groups} "
+                    f"truncated={n_truncated}/{len(resp_lens)} "
+                    f"rewards[{reward_summary}]"
+                )
+            else:
+                print0(
+                    f"[step {step:04d}] dynamic sampling: no valid groups after "
+                    f"{_ds_rounds} rounds — skipping gradient update"
+                )
+                examples, rollouts, resp_lens, n_truncated = [], [], [], 0
+                rewards, mean_reward, reward_summary = [], 0.0, "n=0"
+                batch, advantages = None, None
         else:
-            batch = None
-            advantages = None
-            mean_reward = 0.0
-            reward_summary = ""
+            examples, rollouts, resp_lens, n_truncated = [], [], [], 0
+            rewards, mean_reward, reward_summary = [], 0.0, ""
+            batch, advantages = None, None
 
-        phase_t0 = time.time()
-        broadcast_result = broadcast_batch(
-            master_process, ddp, device, ddp_rank, ddp_world_size, batch, advantages, mean_reward,
-        )
-        batch = broadcast_result.batch
-        advantages = broadcast_result.advantages
-        mean_reward = broadcast_result.mean_reward
-        batch, advantages = local_shard(batch, advantages, ddp_rank, ddp_world_size)
-        local_bsz = batch["input_ids"].shape[0]
-        phase["broadcast_and_shard_s"] = time.time() - phase_t0
+        # Broadcast skip flag so all DDP ranks agree before the weight-transfer barrier.
+        skip_update = skip_update_master
+        if ddp:
+            skip_tensor = torch.tensor(
+                [1 if skip_update_master else 0], dtype=torch.long, device=device
+            )
+            dist.broadcast(skip_tensor, src=0)
+            skip_update = bool(skip_tensor.item())
 
-        # 5. Old log-probs. With ppo_epochs == 1, weights are frozen across the
-        # single optimizer step, so old_logprobs ≡ logprobs.detach() per
-        # microbatch — skip the duplicate no-grad pass. With >1 epochs we need
-        # a genuinely frozen snapshot, chunked to fit long sequences.
-        total_samples = batch["input_ids"].shape[0]
-        micro_bs = args.train_batch_size
-        n_microbatches = math.ceil(total_samples / micro_bs)
+        if not skip_update:
+            phase_t0 = time.time()
+            broadcast_result = broadcast_batch(
+                master_process, ddp, device, ddp_rank, ddp_world_size,
+                batch, advantages, mean_reward,
+            )
+            batch = broadcast_result.batch
+            advantages = broadcast_result.advantages
+            mean_reward = broadcast_result.mean_reward
+            batch, advantages = local_shard(batch, advantages, ddp_rank, ddp_world_size)
+            local_bsz = batch["input_ids"].shape[0]
+            phase["broadcast_and_shard_s"] = time.time() - phase_t0
 
-        phase_t0 = time.time()
-        if args.ppo_epochs > 1:
-            old_logprobs_chunks = []
-            with torch.no_grad():
+            # Old log-probs: with ppo_epochs == 1 ratio is always 1 and clipping
+            # never fires; with >1 epochs we freeze a snapshot so Clip-Higher and
+            # Clip-Low actually activate on subsequent passes over the same rollout.
+            total_samples = batch["input_ids"].shape[0]
+            micro_bs = args.train_batch_size
+            n_microbatches = math.ceil(total_samples / micro_bs)
+
+            phase_t0 = time.time()
+            if args.ppo_epochs > 1:
+                old_logprobs_chunks = []
+                with torch.no_grad():
+                    for mb in range(n_microbatches):
+                        start = mb * micro_bs
+                        end = min(start + micro_bs, total_samples)
+                        lp_mb, _ = get_logprobs(
+                            raw_model,
+                            batch["input_ids"][start:end],
+                            batch["attention_mask"][start:end],
+                            batch["response_mask"][start:end],
+                        )
+                        old_logprobs_chunks.append(lp_mb)
+                old_logprobs = torch.cat(old_logprobs_chunks, dim=0)
+            else:
+                old_logprobs = None
+            phase["old_logprobs_s"] = time.time() - phase_t0
+
+            phase_t0 = time.time()
+            total_loss = 0.0
+            grad_norms: list[float] = []
+            for _epoch in range(args.ppo_epochs):
+                optimizer.zero_grad()
                 for mb in range(n_microbatches):
                     start = mb * micro_bs
                     end = min(start + micro_bs, total_samples)
-                    lp_mb, _ = get_logprobs(
-                        raw_model,
-                        batch["input_ids"][start:end],
-                        batch["attention_mask"][start:end],
-                        batch["response_mask"][start:end],
+                    mb_ids = batch["input_ids"][start:end]
+                    mb_attn = batch["attention_mask"][start:end]
+                    mb_resp = batch["response_mask"][start:end]
+                    mb_advantages = advantages[start:end]
+
+                    logprobs, shift_mask = get_logprobs(model, mb_ids, mb_attn, mb_resp)
+                    mb_old_lp = (
+                        logprobs.detach() if old_logprobs is None
+                        else old_logprobs[start:end]
                     )
-                    old_logprobs_chunks.append(lp_mb)
-            # Shape: [B, T-1] per-token log-probs of the frozen snapshot.
-            old_logprobs = torch.cat(old_logprobs_chunks, dim=0)
+                    loss = loss_fn(
+                        logprobs=logprobs,
+                        old_logprobs=mb_old_lp,
+                        advantages=mb_advantages,
+                        response_mask=shift_mask,
+                        clip=args.clip,
+                        kl_coeff=args.kl_coeff,
+                    ) / n_microbatches
+                    loss.backward()
+                    total_loss += loss.item()
+
+                grad_norm = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), 1.0)
+                grad_norms.append(float(grad_norm))
+                optimizer.step()
+            phase["update_s"] = time.time() - phase_t0
         else:
-            old_logprobs = None
-        phase["old_logprobs_s"] = time.time() - phase_t0
+            local_bsz = 0
+            total_loss = 0.0
+            grad_norms = []
+            phase.setdefault("broadcast_and_shard_s", 0.0)
+            phase.setdefault("old_logprobs_s", 0.0)
+            phase.setdefault("update_s", 0.0)
 
-        # 6. Policy update: ppo_epochs optimizer steps over the rollout batch,
-        # each with grad accumulation across micro-batches.
-        phase_t0 = time.time()
-        total_loss = 0.0
-        grad_norms: list[float] = []
-        for _epoch in range(args.ppo_epochs):
-            optimizer.zero_grad()
-            for mb in range(n_microbatches):
-                start = mb * micro_bs
-                end = min(start + micro_bs, total_samples)
-                mb_ids = batch["input_ids"][start:end]
-                mb_attn = batch["attention_mask"][start:end]
-                mb_resp = batch["response_mask"][start:end]
-                mb_advantages = advantages[start:end]
+        # Advance LR schedule every step (including skipped ones).
+        scheduler.step()
 
-                logprobs, shift_mask = get_logprobs(model, mb_ids, mb_attn, mb_resp)
-                mb_old_lp = logprobs.detach() if old_logprobs is None else old_logprobs[start:end]
-                loss = loss_fn(
-                    logprobs=logprobs,
-                    old_logprobs=mb_old_lp,
-                    advantages=mb_advantages,
-                    response_mask=shift_mask,
-                    clip=args.clip,
-                    kl_coeff=args.kl_coeff,
-                ) / n_microbatches
-                loss.backward()
-                total_loss += loss.item()
-
-            grad_norm = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), 1.0)
-            grad_norms.append(float(grad_norm))
-            optimizer.step()
-        phase["update_s"] = time.time() - phase_t0
-
-        # 7. In-place sync to remote worker so next-step rollouts are on-policy.
+        # Sync updated weights to vLLM for the next rollout step.
         phase_t0 = time.time()
         sync_weights_to_vllm_inplace(
             train_model=raw_model,
@@ -589,23 +666,15 @@ if __name__ == "__main__":
         grad_norm_max = max(grad_norms) if grad_norms else 0.0
         response_len_mean = mean(resp_lens) if master_process and resp_lens else 0.0
         truncation_ratio = (
-            (n_truncated / len(resp_lens))
-            if master_process and resp_lens
-            else 0.0
+            (n_truncated / len(resp_lens)) if master_process and resp_lens else 0.0
         )
         train_elapsed_s = time.time() - train_start_time
 
         print0(
-            f"step {step:04d}/{'inf' if args.num_steps == -1 else f'{args.num_steps:04d}'} | loss: {avg_loss:.4f} | reward: {mean_reward:.4f} "
-            f"| local_bsz: {local_bsz} | dt: {dt:.1f}s "
-            f"| phases(fetch={phase.get('fetch_prompts_s', 0.0):.1f}s "
-            f"rollout={phase.get('rollout_s', 0.0):.1f}s "
-            f"reward={phase.get('reward_s', 0.0):.1f}s "
-            f"pack={phase.get('pack_batch_s', 0.0):.1f}s "
-            f"bcast={phase['broadcast_and_shard_s']:.1f}s "
-            f"oldlp={phase['old_logprobs_s']:.1f}s "
-            f"update={phase['update_s']:.1f}s "
-            f"sync={phase['sync_rollout_s']:.1f}s)"
+            f"step {step:04d}/{'inf' if args.num_steps == -1 else f'{args.num_steps:04d}'} | "
+            f"loss: {avg_loss:.4f} | reward: {mean_reward:.4f} "
+            f"| local_bsz: {local_bsz} | ds_rounds: {_ds_rounds} | dt: {dt:.1f}s "
+            f"| lr: {scheduler.get_last_lr()[0]:.2e}"
         )
 
         wandb_metrics = {
@@ -613,23 +682,23 @@ if __name__ == "__main__":
             "train/avg_reward": mean_reward,
             "train/grad_norm_mean": grad_norm_mean,
             "train/grad_norm_max": grad_norm_max,
-            "train/learning_rate": optimizer.param_groups[0]["lr"],
+            "train/learning_rate": scheduler.get_last_lr()[0],
             "train/step_time_s": dt,
             "train/elapsed_s": train_elapsed_s,
             "train/local_batch_size": float(local_bsz),
             "train/response_len_mean": response_len_mean,
             "train/truncation_ratio": truncation_ratio,
-            "timing/fetch_prompts_s": phase.get("fetch_prompts_s", 0.0),
-            "timing/rollout_s": phase.get("rollout_s", 0.0),
-            "timing/reward_s": phase.get("reward_s", 0.0),
+            "train/dynamic_sampling_rounds": float(_ds_rounds),
+            "train/valid_groups": float(num_valid_groups),
+            "timing/dynamic_sampling_s": phase.get("dynamic_sampling_s", 0.0),
+            "timing/reward_shaping_s": phase.get("reward_shaping_s", 0.0),
             "timing/pack_batch_s": phase.get("pack_batch_s", 0.0),
-            "timing/broadcast_and_shard_s": phase["broadcast_and_shard_s"],
-            "timing/old_logprobs_s": phase["old_logprobs_s"],
-            "timing/update_s": phase["update_s"],
+            "timing/broadcast_and_shard_s": phase.get("broadcast_and_shard_s", 0.0),
+            "timing/old_logprobs_s": phase.get("old_logprobs_s", 0.0),
+            "timing/update_s": phase.get("update_s", 0.0),
             "timing/sync_rollout_s": phase["sync_rollout_s"],
         }
 
-        # 8. Evaluation
         if (
             master_process
             and validation_loader is not None
@@ -655,18 +724,15 @@ if __name__ == "__main__":
 
         wandb_logger.log_metrics(step=step, metrics=wandb_metrics)
 
-        # 9. Periodic checkpoint
         if args.save_every > 0 and (step + 1) % args.save_every == 0 and master_process:
             step_path = os.path.join(args.save_dir, f"step_{step+1:06d}")
             raw_model.save_pretrained(step_path, safe_serialization=True)
             tokenizer.save_pretrained(step_path)
             print0(f"[step {step:04d}] saved checkpoint to {step_path}")
 
-        # 10. Epoch-exhaustion stop: when num_steps == -1, run until the loader
-        # wraps from epoch 0 to epoch 1 (one full pass through the dataset).
         if args.num_steps == -1:
             _stop = torch.zeros(1, dtype=torch.long, device=device)
-            if master_process:
+            if master_process and _loader_state is not None:
                 _stop[0] = 1 if _loader_state["epoch"] > 0 else 0
             if ddp:
                 dist.broadcast(_stop, src=0)
