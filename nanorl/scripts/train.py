@@ -21,6 +21,8 @@ import itertools
 from typing import NamedTuple
 from statistics import mean
 
+from tqdm import tqdm
+
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -32,7 +34,6 @@ from nanorl.loss import ALGORITHMS, compute_advantages
 from nanorl.rollout import (
     get_logprobs,
     generate_rollouts_remote,
-    generate_rollouts_remote_async,
     remote_vllm_init_weight_transfer,
     prepare_batch,
     sync_weights_to_vllm_inplace,
@@ -41,9 +42,9 @@ from nanorl.rollout import (
 from nanorl.data import (
     build_rl_dataset,
     distributed_rl_loader,
+    RLExample,
     RewardWorkerPool,
     apply_overlong_shaping,
-    split_rl_dataset,
 )
 from nanorl.weave_logging import WeaveTrajectoryLogger
 from nanorl.wandb_logging import WandbTrainingLogger
@@ -55,11 +56,11 @@ class _BroadcastBatchResult(NamedTuple):
     mean_reward: float
 
 
-class _ValidationStats(NamedTuple):
+class _AimeEvalStats(NamedTuple):
     mean_reward: float
-    response_len_mean: float
-    truncation_ratio: float
-    duration_s: float
+    generation_entropy: float
+    num_problems: int
+    num_correct: int
 
 
 class _WeightTransferInitConfig(NamedTuple):
@@ -68,68 +69,133 @@ class _WeightTransferInitConfig(NamedTuple):
     world_size: int
 
 
-def _compute_effective_eval_prompts(
-    *,
-    eval_prompts_per_step: int,
-    prompts_per_step: int,
-    validation_dataset_size: int,
-) -> int:
-    """Pick a safe validation batch size for the distributed loader."""
-    requested = eval_prompts_per_step if eval_prompts_per_step > 0 else prompts_per_step
-    if validation_dataset_size <= 0:
-        return 0
-    return min(requested, validation_dataset_size)
+_AIME_BOXED_HINT = (
+    "\n\nPlease reason step by step, and put your final answer in \\boxed{}."
+)
 
 
-def _run_validation_step(
+def _load_aime_dataset(dataset_name: str) -> list[tuple[str, str]]:
+    """Load an AIME dataset, return list of (prompt_text, ground_truth)."""
+    from datasets import load_dataset
+    ds = load_dataset(dataset_name, split="train")
+    first_row = dict(ds[0])
+    problem_col = next(
+        (c for c in ["problem", "question", "prompt"] if c in first_row), None
+    )
+    answer_col = next(
+        (c for c in ["answer", "final_answer", "solution"] if c in first_row), None
+    )
+    if not problem_col or not answer_col:
+        raise ValueError(
+            f"Cannot detect columns in {dataset_name}, keys={list(first_row.keys())}"
+        )
+    examples = []
+    for row in ds:
+        problem = str(row[problem_col]).strip()
+        answer = str(row[answer_col]).strip()
+        examples.append((problem + _AIME_BOXED_HINT, answer))
+    return examples
+
+
+async def _async_generate_with_progress(
     *,
-    args: argparse.Namespace,
-    loader,
+    base_url: str,
+    prompts: list[str],
+    num_samples: int,
+    max_new_tokens: int,
+    temperature: float,
+    top_k: int,
+    chunk_size: int,
+    max_in_flight: int,
+    desc: str,
+) -> list[dict]:
+    """Send chunked concurrent rollout requests, updating a tqdm bar per chunk."""
+    chunks = [prompts[i : i + chunk_size] for i in range(0, len(prompts), chunk_size)]
+    semaphore = asyncio.Semaphore(max_in_flight)
+    pbar = tqdm(total=len(prompts), desc=desc, unit="prompt", leave=False)
+
+    async def _do_chunk(idx: int, chunk: list[str]) -> tuple[int, list[dict]]:
+        async with semaphore:
+            result = await asyncio.to_thread(
+                generate_rollouts_remote,
+                base_url, chunk, num_samples, max_new_tokens, temperature, top_k,
+            )
+            pbar.update(len(chunk))
+            return idx, result
+
+    results = await asyncio.gather(*[_do_chunk(i, c) for i, c in enumerate(chunks)])
+    pbar.close()
+    rollouts: list[dict] = []
+    for _, chunk_rollouts in sorted(results, key=lambda x: x[0]):
+        rollouts.extend(chunk_rollouts)
+    return rollouts
+
+
+def _run_aime_eval(
+    *,
+    dataset_name: str,
+    examples: list[tuple[str, str]],
+    raw_model,
+    tokenizer,
     rewarder: RewardWorkerPool,
-    weave_logger: WeaveTrajectoryLogger,
+    args: argparse.Namespace,
+    device: torch.device,
     step: int,
-) -> _ValidationStats:
-    """Run one validation rollout/reward pass on rank 0."""
-    validation_t0 = time.time()
-    examples, _loader_state = next(loader)
-    prompt_texts = [example.prompt for example in examples]
-    rollouts = asyncio.run(generate_rollouts_remote_async(
+) -> _AimeEvalStats:
+    """Generate aime_eval_samples completions per problem and compute reward + entropy."""
+    prompts = [p for p, _ in examples]
+    rl_examples = [
+        RLExample(id=f"{dataset_name}/{i}", prompt=p, ground_truth=gt)
+        for i, (p, gt) in enumerate(examples)
+    ]
+
+    rollouts = asyncio.run(_async_generate_with_progress(
         base_url=args.rollout_worker_url,
-        prompts=prompt_texts,
-        num_samples=args.num_samples,
+        prompts=prompts,
+        num_samples=args.aime_eval_samples,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         top_k=args.top_k,
-        prompt_chunk_size=args.eval_async_prompt_chunk_size,
-        max_in_flight_requests=args.eval_async_max_in_flight,
+        chunk_size=args.aime_eval_chunk_size,
+        max_in_flight=args.aime_eval_max_in_flight,
+        desc=dataset_name,
     ))
-    responses = [rollout["response"] for rollout in rollouts]
-    expanded_examples = [examples[i // args.num_samples] for i in range(len(rollouts))]
-    rewards, infos = rewarder.score(expanded_examples, responses, step=step)
-    response_lengths = [len(rollout["response_ids"]) for rollout in rollouts]
-    shaped_rewards = apply_overlong_shaping(rewards, response_lengths, args.max_new_tokens)
-    weave_logger.log_trajectories(
-        step=step,
-        run_name=f"{args.run_name}_validation",
-        examples=expanded_examples,
-        responses=responses,
-        reward_infos=infos,
-        verifier_rewards=rewards,
-        training_rewards=shaped_rewards,
-        num_samples_per_prompt=args.num_samples,
-        rollouts=rollouts,
-        max_new_tokens=args.max_new_tokens,
-    )
-    mean_reward = sum(shaped_rewards) / len(shaped_rewards) if shaped_rewards else 0.0
-    response_len_mean = mean(response_lengths) if response_lengths else 0.0
-    num_truncated = sum(1 for length in response_lengths if length >= args.max_new_tokens)
-    truncation_ratio = (num_truncated / len(response_lengths)) if response_lengths else 0.0
-    duration_s = time.time() - validation_t0
-    return _ValidationStats(
-        mean_reward=mean_reward,
-        response_len_mean=response_len_mean,
-        truncation_ratio=truncation_ratio,
-        duration_s=duration_s,
+
+    responses = [r["response"] for r in rollouts]
+    resp_lens = [len(r["response_ids"]) for r in rollouts]
+    expanded = [rl_examples[i // args.aime_eval_samples] for i in range(len(rollouts))]
+    rewards_raw, _ = rewarder.score(expanded, responses, step=step)
+    rewards = apply_overlong_shaping(rewards_raw, resp_lens, args.max_new_tokens)
+
+    # Generation entropy: H(π) ≈ -mean_token(log π(aₜ | s, a<t))
+    # Responses were sampled from the current policy so E[-log π] = H(π).
+    batch = prepare_batch(rollouts, rewards, tokenizer, args.max_seq_len, device)
+    total = batch["input_ids"].shape[0]
+    entropy_vals: list[float] = []
+    raw_model.eval()
+    try:
+        with torch.no_grad():
+            for start in range(0, total, args.train_batch_size):
+                end = min(start + args.train_batch_size, total)
+                lp, mask = get_logprobs(
+                    raw_model,
+                    batch["input_ids"][start:end],
+                    batch["attention_mask"][start:end],
+                    batch["response_mask"][start:end],
+                )
+                token_counts = mask.sum(dim=-1)
+                neg_lp_sums = -(lp * mask).sum(dim=-1)
+                for tc, nls in zip(token_counts.tolist(), neg_lp_sums.tolist()):
+                    if tc > 0:
+                        entropy_vals.append(nls / tc)
+    finally:
+        raw_model.train()
+
+    return _AimeEvalStats(
+        mean_reward=mean(rewards) if rewards else 0.0,
+        generation_entropy=mean(entropy_vals) if entropy_vals else 0.0,
+        num_problems=len(examples),
+        num_correct=sum(1 for r in rewards if r > 0),
     )
 
 
@@ -247,10 +313,9 @@ if __name__ == "__main__":
     parser.add_argument("--max-seq-len", type=int, default=2048)
     # Evaluation
     parser.add_argument("--eval-every", type=int, default=20)
-    parser.add_argument("--eval-prompts-per-step", type=int, default=0)
-    parser.add_argument("--validation-size", type=float, default=0.1)
-    parser.add_argument("--eval-async-prompt-chunk-size", type=int, default=64)
-    parser.add_argument("--eval-async-max-in-flight", type=int, default=8)
+    parser.add_argument("--aime-eval-samples", type=int, default=32, help="Completions per AIME problem during eval")
+    parser.add_argument("--aime-eval-chunk-size", type=int, default=4, help="Prompts per async chunk for AIME eval")
+    parser.add_argument("--aime-eval-max-in-flight", type=int, default=64, help="Max concurrent chunk requests for AIME eval")
     # Task / Reward
     parser.add_argument("--reward-workers", type=int, default=0, help="Reward worker pool size")
     # Runtime
@@ -354,47 +419,30 @@ if __name__ == "__main__":
     print0("Initial trainer weights synced to rollout worker.")
 
     # -----------------------------------------------------------------------------
-    # RL dataset + reward worker pool + loss fn
+    # RL dataset + AIME eval sets + reward worker pool + loss fn
     if master_process:
         dataset = build_rl_dataset()
-        dataset_split = split_rl_dataset(
-            dataset,
-            validation_size=args.validation_size,
-            seed=args.seed,
-        )
-        train_dataset = dataset_split.train_dataset
-        validation_dataset = dataset_split.validation_dataset
         loader = distributed_rl_loader(
-            train_dataset,
+            dataset,
             prompts_per_step=args.prompts_per_step,
             world_size=1,
             rank=0,
             seed=args.seed,
         )
-        validation_prompts_per_step = _compute_effective_eval_prompts(
-            eval_prompts_per_step=args.eval_prompts_per_step,
-            prompts_per_step=args.prompts_per_step,
-            validation_dataset_size=len(validation_dataset),
-        )
-        validation_loader = None
-        if validation_prompts_per_step > 0:
-            validation_loader = distributed_rl_loader(
-                validation_dataset,
-                prompts_per_step=validation_prompts_per_step,
-                world_size=1,
-                rank=0,
-                seed=args.seed + 17,
-            )
         rewarder = RewardWorkerPool(num_workers=args.reward_workers)
-        print0(f"{len(train_dataset)=}")
-        print0(f"{len(validation_dataset)=}")
-        print0(f"{validation_prompts_per_step=}")
-        print0(f"{args.eval_async_prompt_chunk_size=}")
-        print0(f"{args.eval_async_max_in_flight=}")
+        print0(f"Train dataset size: {len(dataset)}")
+        print0(f"AIME eval samples per problem: {args.aime_eval_samples}")
+        print0("Loading AIME 2024 dataset...")
+        # aime_2024_examples = _load_aime_dataset("MathArena/aime_2024")
+        # print0(f"AIME 2024: {len(aime_2024_examples)} problems")
+        print0("Loading AIME 2025 dataset...")
+        aime_2025_examples = _load_aime_dataset("MathArena/aime_2025")
+        print0(f"AIME 2025: {len(aime_2025_examples)} problems")
     else:
         loader = None
-        validation_loader = None
         rewarder = None
+        aime_2024_examples = None
+        aime_2025_examples = None
     loss_fn = ALGORITHMS[args.algorithm]
 
     # -----------------------------------------------------------------------------
@@ -701,26 +749,38 @@ if __name__ == "__main__":
 
         if (
             master_process
-            and validation_loader is not None
             and args.eval_every > 0
             and (step + 1) % args.eval_every == 0
         ):
-            print0("Evaluating on validation split...")
-            validation_stats = _run_validation_step(
-                args=args,
-                loader=validation_loader,
-                rewarder=rewarder,
-                weave_logger=weave_logger,
-                step=step,
-            )
-            validation_metrics = {
-                "validation/mean_reward": validation_stats.mean_reward,
-                "validation/response_len_mean": validation_stats.response_len_mean,
-                "validation/truncation_ratio": validation_stats.truncation_ratio,
-                "validation/eval_time_s": validation_stats.duration_s,
-            }
-            wandb_metrics.update(validation_metrics)
-            print0(f"{validation_stats=}")
+            for aime_tag, aime_examples in [
+                # ("aime_2024", aime_2024_examples),
+                ("aime_2025", aime_2025_examples),
+            ]:
+                print0(f"[step {step:04d}] Evaluating on {aime_tag} ({len(aime_examples)} problems, {args.aime_eval_samples} samples each)...")
+                try:
+                    aime_stats = _run_aime_eval(
+                        dataset_name=aime_tag,
+                        examples=aime_examples,
+                        raw_model=raw_model,
+                        tokenizer=tokenizer,
+                        rewarder=rewarder,
+                        args=args,
+                        device=device,
+                        step=step,
+                    )
+                    wandb_metrics.update({
+                        f"validation/{aime_tag}/mean_reward": aime_stats.mean_reward,
+                        f"validation/{aime_tag}/generation_entropy": aime_stats.generation_entropy,
+                        f"validation/{aime_tag}/num_correct": float(aime_stats.num_correct),
+                    })
+                    print0(
+                        f"[step {step:04d}] {aime_tag}: "
+                        f"mean_reward={aime_stats.mean_reward:.4f} "
+                        f"entropy={aime_stats.generation_entropy:.4f} "
+                        f"correct={aime_stats.num_correct}/{aime_stats.num_problems * args.aime_eval_samples}"
+                    )
+                except Exception as e:
+                    print0(f"[step {step:04d}] {aime_tag} eval failed: {e}")
 
         wandb_logger.log_metrics(step=step, metrics=wandb_metrics)
 

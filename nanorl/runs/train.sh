@@ -13,8 +13,8 @@ ROLLOUT_PORT="${ROLLOUT_PORT:-8047}"
 ROLLOUT_GPUS="${ROLLOUT_GPUS:-2}"
 TRAIN_GPUS="${TRAIN_GPUS:-3}"
 ROLLOUT_GPU_MEM_UTIL="${ROLLOUT_GPU_MEM_UTIL:-0.9}"
-NUM_STEPS="${NUM_STEPS:--1}"
-SAVE_EVERY="${SAVE_EVERY:-500}"
+NUM_STEPS="${NUM_STEPS:-1}"
+SAVE_EVERY="${SAVE_EVERY:-1}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-4}"
 LR="${LR:-1e-6}"
 PROMPTS_PER_STEP="${PROMPTS_PER_STEP:-16}"
@@ -96,18 +96,19 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" \
     --algorithm dapo \
     --run-name "$TAG" \
     --rollout-worker-url "http://$ROLLOUT_HOST:$ROLLOUT_PORT" \
+    --rollout-worker-world-size "$ROLLOUT_TP" \
     --save-dir "$SAVE_DIR" \
     --num-steps "$NUM_STEPS" \
     --prompts-per-step "$PROMPTS_PER_STEP" \
     --num-samples 8 \
     --train-batch-size "$TRAIN_BATCH_SIZE" \
     --max-new-tokens 8192 \
-    --max-seq-len 12288 \
+    --max-seq-len 16384 \
     --reward-workers 8 \
-    --eval-every 20 \
+    --eval-every 1 \
     --save-every "$SAVE_EVERY" \
     --lr "$LR" \
-    --weave-project dapo_run \
+    --weave-project dapo_math_run \
     --ppo-epochs 4 \
     --kl-coeff 0.0 \
     --temperature 1.0 \
